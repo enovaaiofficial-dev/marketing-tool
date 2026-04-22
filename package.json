@@ -1,0 +1,38 @@
+{
+  "name": "marketing-tool",
+  "version": "1.0.0",
+  "description": "Marketing automation tool for group member extraction",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
+    "start": "electron-vite build && electron .",
+    "dev:file": "electron-vite build && electron ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.4",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "autoprefixer": "^10.5.0",
+    "electron": "^41.2.2",
+    "electron-vite": "^5.0.0",
+    "postcss": "^8.5.10",
+    "tailwindcss": "^4.2.4",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.9"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.9.0",
+    "csv-writer": "^1.6.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  }
+}
