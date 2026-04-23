@@ -53,12 +53,31 @@ const MIN_DELAY_MS = 2000;
 const MAX_DELAY_MS = 6000;
 const MAX_NO_NEW = 30;
 const SCROLLS_PER_BATCH = 3;
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 5000;
 
 interface AccountSlot {
   id: number;
   token: string;
   name: string;
   failCount: number;
+}
+
+interface PersistedState {
+  runId: number;
+  outputPath: string;
+  groupIds: string[];
+  groupIndex: number;
+  groupId: string;
+  batch: number;
+  totalExtracted: number;
+  accountIdIndex: number;
+}
+
+let globalScraper: GroupScraper | null = null;
+
+export function getActiveScraper(): GroupScraper | null {
+  return globalScraper;
 }
 
 export class GroupScraper {
@@ -70,6 +89,12 @@ export class GroupScraper {
   private scraperWindow: BrowserWindow | null = null;
   private accounts: AccountSlot[] = [];
   private currentAccountIndex = 0;
+  private currentGroupIndex = 0;
+  private currentGroupId = "";
+  private currentBatch = 0;
+  private outputPath = "";
+  private groupIds: string[] = [];
+  private running = false;
 
   constructor(win: BrowserWindow) {
     this.mainWin = win;
@@ -83,9 +108,10 @@ export class GroupScraper {
     this.abortFlag = false;
     this.totalExtracted = 0;
     this.currentAccountIndex = 0;
+    this.running = true;
+    globalScraper = this;
 
     const db = getDB();
-    let outputPath: string;
     let startGroupIndex = 0;
     let startBatch = 0;
 
@@ -99,13 +125,14 @@ export class GroupScraper {
     if (resumeRunId) {
       const run = db
         .prepare(
-          "SELECT output_path, group_ids, current_group_index, current_batch, members_extracted, scroll_position, last_account_id FROM extraction_runs WHERE id = ?"
+          "SELECT output_path, group_ids, current_group_index, current_group_id, current_batch, members_extracted, last_account_id FROM extraction_runs WHERE id = ?"
         )
         .get(resumeRunId) as any;
       if (!run) throw new Error("Run " + resumeRunId + " not found");
-      outputPath = run.output_path;
+      this.outputPath = run.output_path;
       groupIds = JSON.parse(run.group_ids);
       startGroupIndex = run.current_group_index ?? 0;
+      this.currentGroupId = run.current_group_id ?? "";
       startBatch = run.current_batch ?? 0;
       this.totalExtracted = run.members_extracted ?? 0;
       this.runId = resumeRunId;
@@ -119,23 +146,31 @@ export class GroupScraper {
         .prepare("SELECT member_id FROM extraction_members WHERE run_id = ?")
         .all(resumeRunId) as any[];
       this.seenMemberIds = new Set(existing.map((r) => r.member_id));
+
+      this.rebuildCsvFromDb();
     } else {
       this.seenMemberIds.clear();
       const { filePath } = await dialog.showSaveDialog(this.mainWin, {
         defaultPath: join(app.getPath("documents"), "extraction-" + Date.now() + ".csv"),
         filters: [{ name: "CSV", extensions: ["csv"] }],
       });
-      if (!filePath) throw new Error("No output path selected");
-      outputPath = filePath;
+      if (!filePath) {
+        this.running = false;
+        globalScraper = null;
+        throw new Error("No output path selected");
+      }
+      this.outputPath = filePath;
 
       const result = db
         .prepare(
           "INSERT INTO extraction_runs (group_ids, source_account_id, output_path) VALUES (?, ?, ?)"
         )
-        .run(JSON.stringify(groupIds), accountId, outputPath);
+        .run(JSON.stringify(groupIds), accountId, filePath);
       this.runId = result.lastInsertRowid as number;
-      this.initializeCsv(outputPath);
+      this.initializeCsv(filePath);
     }
+
+    this.groupIds = groupIds;
 
     await this.initScraperWindow();
 
@@ -145,6 +180,9 @@ export class GroupScraper {
 
         const groupId = groupIds[index];
         const batchStart = index === startGroupIndex ? startBatch : 0;
+        this.currentGroupIndex = index;
+        this.currentGroupId = groupId;
+        this.currentBatch = batchStart;
 
         this.emitProgress({
           current_group_id: groupId,
@@ -155,13 +193,15 @@ export class GroupScraper {
           status: "running",
         });
 
-        await this.scrapeGroup(outputPath, groupId, index, groupIds.length, batchStart);
+        await this.scrapeGroup(groupId, index, groupIds.length, batchStart);
       }
     } finally {
+      this.running = false;
       if (this.scraperWindow && !this.scraperWindow.isDestroyed()) {
         this.scraperWindow.destroy();
         this.scraperWindow = null;
       }
+      globalScraper = null;
     }
 
     const finalStatus = this.abortFlag ? "stopped" : "completed";
@@ -172,24 +212,61 @@ export class GroupScraper {
     }
 
     this.emitProgress({
-      current_group_id: groupIds[Math.max(0, groupIds.length - 1)] ?? "",
-      current_group_index: Math.max(0, groupIds.length - 1),
-      total_groups: groupIds.length,
+      current_group_id: this.groupIds[Math.max(0, this.groupIds.length - 1)] ?? "",
+      current_group_index: Math.max(0, this.groupIds.length - 1),
+      total_groups: this.groupIds.length,
       members_extracted: this.totalExtracted,
       current_batch: 0,
       status: finalStatus,
     });
 
-    return outputPath;
+    return this.outputPath;
   }
 
   stop() {
     this.abortFlag = true;
-    this.saveProgress();
+    this.persistState();
+  }
+
+  forceSave() {
+    this.persistState();
   }
 
   getRunId(): number | null {
     return this.runId;
+  }
+
+  isRunning(): boolean {
+    return this.running;
+  }
+
+  private getPersistedState(): PersistedState | null {
+    if (!this.runId) return null;
+    return {
+      runId: this.runId,
+      outputPath: this.outputPath,
+      groupIds: this.groupIds,
+      groupIndex: this.currentGroupIndex,
+      groupId: this.currentGroupId,
+      batch: this.currentBatch,
+      totalExtracted: this.totalExtracted,
+      accountIdIndex: this.currentAccountIndex,
+    };
+  }
+
+  private persistState() {
+    if (!this.runId) return;
+    const db = getDB();
+    db.prepare(
+      "UPDATE extraction_runs SET status = 'stopped', current_group_index = ?, current_group_id = ?, current_batch = ?, members_extracted = ?, last_account_id = ? WHERE id = ?"
+    ).run(
+      this.currentGroupIndex,
+      this.currentGroupId,
+      this.currentBatch,
+      this.totalExtracted,
+      this.accounts[this.currentAccountIndex]?.id ?? null,
+      this.runId
+    );
   }
 
   private async initScraperWindow() {
@@ -201,8 +278,31 @@ export class GroupScraper {
     const ses = session.fromPartition("persist:scraper");
     ses.clearStorageData();
 
-    const cookies = await getSessionCookies(account.token);
-    for (const cookie of cookies) {
+    let cookies: Awaited<ReturnType<typeof getSessionCookies>>;
+    let lastErr: Error | null = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        cookies = await getSessionCookies(account.token);
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        if (attempt < 3) {
+          this.emitProgress({
+            current_group_id: this.currentGroupId,
+            current_group_index: this.currentGroupIndex,
+            total_groups: this.groupIds.length,
+            members_extracted: this.totalExtracted,
+            current_batch: this.currentBatch,
+            status: "running",
+          });
+          await this.delay(5000 * attempt);
+        }
+      }
+    }
+    if (lastErr) throw lastErr;
+
+    for (const cookie of cookies!) {
       await ses.cookies.set({
         url: "https://www.facebook.com",
         name: cookie.name,
@@ -228,6 +328,10 @@ export class GroupScraper {
     this.scraperWindow.webContents.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     );
+
+    this.scraperWindow.on("close", (e) => {
+      e.preventDefault();
+    });
   }
 
   private async rotateAccount(): Promise<boolean> {
@@ -248,8 +352,21 @@ export class GroupScraper {
     writeFileSync(outputPath, csvStringifier.getHeaderString() ?? "", "utf8");
   }
 
+  private rebuildCsvFromDb() {
+    if (!this.runId) return;
+    const db = getDB();
+    this.initializeCsv(this.outputPath);
+    const rows = db
+      .prepare(
+        "SELECT member_id, group_id, extracted_at, source_account FROM extraction_members WHERE run_id = ? ORDER BY id"
+      )
+      .all(this.runId) as any[];
+    if (rows.length > 0) {
+      this.appendBatchToCsv(this.outputPath, rows);
+    }
+  }
+
   private async scrapeGroup(
-    outputPath: string,
     groupId: string,
     groupIndex: number,
     totalGroups: number,
@@ -263,15 +380,37 @@ export class GroupScraper {
     const groupUrl =
       "https://www.facebook.com/groups/" + encodeURIComponent(groupId) + "/members";
 
-    await this.loadPage(this.scraperWindow!, groupUrl);
-    await this.delay(3000);
+    let retries = 0;
+    while (retries < MAX_RETRIES) {
+      try {
+        const win = this.scraperWindow;
+        if (!win || win.isDestroyed()) {
+          await this.initScraperWindow();
+        }
+        await this.loadPage(this.scraperWindow!, groupUrl);
+        await this.delay(3000);
+        break;
+      } catch (err) {
+        retries++;
+        if (retries >= MAX_RETRIES) {
+          this.recordError(groupId, startBatch, err);
+          return;
+        }
+        this.recordError(groupId, startBatch, new Error("Page load failed (retry " + retries + "/" + MAX_RETRIES + "), waiting..."));
+        await this.delay(RETRY_BASE_MS * retries);
+      }
+    }
 
     if (startBatch > 0) {
       for (let i = 0; i < startBatch; i++) {
-        if (this.scraperWindow && !this.scraperWindow.isDestroyed()) {
-          await this.scraperWindow.webContents.executeJavaScript(SCROLL_JS);
+        const win = this.scraperWindow;
+        if (!win || win.isDestroyed()) break;
+        try {
+          await win.webContents.executeJavaScript(SCROLL_JS);
+          await this.delay(400);
+        } catch {
+          break;
         }
-        await this.delay(500);
       }
       await this.delay(2000);
     }
@@ -280,14 +419,20 @@ export class GroupScraper {
     let noNewCount = 0;
     let extractCount = 0;
     let prevVisibleCount = 0;
+    let consecutiveErrors = 0;
 
     while (!this.abortFlag) {
       currentBatch++;
+      this.currentBatch = currentBatch;
 
       try {
         const win = this.scraperWindow;
         if (!win || win.isDestroyed()) {
-          break;
+          await this.initScraperWindow();
+          await this.loadPage(this.scraperWindow!, groupUrl);
+          await this.delay(3000);
+          prevVisibleCount = 0;
+          continue;
         }
 
         for (let s = 0; s < SCROLLS_PER_BATCH; s++) {
@@ -298,10 +443,14 @@ export class GroupScraper {
           "window.scrollTo(0, document.body.scrollHeight);"
         );
 
-        const newVisibleCount: number = await win.webContents.executeJavaScript(
-          WAIT_FOR_NEW_JS + String(prevVisibleCount) + ");"
-        );
-        prevVisibleCount = newVisibleCount;
+        try {
+          const newVisibleCount: number = await win.webContents.executeJavaScript(
+            WAIT_FOR_NEW_JS + String(prevVisibleCount) + ");"
+          );
+          prevVisibleCount = newVisibleCount;
+        } catch {
+          await this.delay(2000);
+        }
 
         const blockInfo: any = await win.webContents.executeJavaScript(CHECK_BLOCK_JS);
         if (blockInfo.isLogin || blockInfo.isBlock || blockInfo.isCaptcha) {
@@ -312,10 +461,12 @@ export class GroupScraper {
               ? "Account blocked/restricted"
               : "Session expired (login page)";
           this.recordError(groupId, currentBatch, new Error(reason + " — account: " + this.accounts[this.currentAccountIndex].name));
+          this.persistState();
 
           const rotated = await this.rotateAccount();
           if (!rotated) {
-            this.recordError(groupId, currentBatch, new Error("All accounts blocked or expired"));
+            this.recordError(groupId, currentBatch, new Error("All accounts blocked or expired. Stopping — resume later."));
+            this.persistState();
             break;
           }
 
@@ -337,6 +488,7 @@ export class GroupScraper {
         if (newIds.length > 0) {
           noNewCount = 0;
           extractCount += newIds.length;
+          consecutiveErrors = 0;
           if (!this.runId) throw new Error("Extraction run not initialized");
 
           const now = new Date().toISOString();
@@ -355,7 +507,7 @@ export class GroupScraper {
             extracted_at: now,
             source_account: accountName,
           }));
-          this.appendBatchToCsv(outputPath, rows);
+          this.appendBatchToCsv(this.outputPath, rows);
           this.totalExtracted += newIds.length;
         } else {
           noNewCount++;
@@ -379,27 +531,50 @@ export class GroupScraper {
           status: "running",
         });
 
-        if (currentBatch % 5 === 0) {
-          this.saveRunProgress(groupIndex, groupId, currentBatch);
-        }
+        this.persistState();
 
         if (noNewCount >= MAX_NO_NEW) break;
 
         await this.randomDelay();
       } catch (error) {
+        consecutiveErrors++;
         this.recordError(groupId, currentBatch, error);
-        const rotated = await this.rotateAccount();
-        if (!rotated) break;
 
-        if (this.scraperWindow && !this.scraperWindow.isDestroyed()) {
-          await this.loadPage(this.scraperWindow, groupUrl);
-          await this.delay(3000);
+        if (consecutiveErrors >= 5) {
+          this.recordError(groupId, currentBatch, new Error("Too many consecutive errors (" + consecutiveErrors + "). Saving progress — resume later."));
+          this.persistState();
+          break;
+        }
+
+        this.persistState();
+        await this.delay(RETRY_BASE_MS * Math.min(consecutiveErrors, 3));
+
+        const win = this.scraperWindow;
+        if (!win || win.isDestroyed()) {
+          try {
+            await this.initScraperWindow();
+            await this.loadPage(this.scraperWindow!, groupUrl);
+            await this.delay(3000);
+          } catch {
+            this.recordError(groupId, currentBatch, new Error("Failed to recover window. Saving progress."));
+            this.persistState();
+            break;
+          }
+        } else {
+          try {
+            await this.loadPage(win, groupUrl);
+            await this.delay(3000);
+          } catch {
+            this.recordError(groupId, currentBatch, new Error("Page reload failed. Saving progress."));
+            this.persistState();
+            break;
+          }
         }
         prevVisibleCount = 0;
       }
     }
 
-    this.saveRunProgress(groupIndex, groupId, currentBatch);
+    this.persistState();
   }
 
   private async loadPage(scraper: BrowserWindow, url: string): Promise<void> {
@@ -424,24 +599,6 @@ export class GroupScraper {
     }
   }
 
-  private saveRunProgress(groupIndex: number, groupId: string, batch: number) {
-    if (!this.runId) return;
-    getDB()
-      .prepare(
-        "UPDATE extraction_runs SET current_group_index = ?, current_group_id = ?, current_batch = ?, members_extracted = ?, scroll_position = ?, last_account_id = ? WHERE id = ?"
-      )
-      .run(groupIndex, groupId, batch, this.totalExtracted, batch * 3000, this.accounts[this.currentAccountIndex].id, this.runId);
-  }
-
-  private saveProgress() {
-    if (!this.runId) return;
-    getDB()
-      .prepare(
-        "UPDATE extraction_runs SET status = 'stopped', members_extracted = ?, last_account_id = ? WHERE id = ?"
-      )
-      .run(this.totalExtracted, this.accounts[this.currentAccountIndex].id, this.runId);
-  }
-
   private appendBatchToCsv(
     outputPath: string,
     rows: { member_id: string; group_id: string; extracted_at: string; source_account: string }[]
@@ -462,17 +619,19 @@ export class GroupScraper {
     };
 
     if (this.runId) {
-      getDB()
-        .prepare(
-          "INSERT INTO extraction_errors (run_id, group_id, batch_number, error_message, timestamp) VALUES (?, ?, ?, ?, ?)"
-        )
-        .run(
-          this.runId,
-          payload.group_id,
-          payload.batch_number,
-          payload.error_message,
-          payload.timestamp
-        );
+      try {
+        getDB()
+          .prepare(
+            "INSERT INTO extraction_errors (run_id, group_id, batch_number, error_message, timestamp) VALUES (?, ?, ?, ?, ?)"
+          )
+          .run(
+            this.runId,
+            payload.group_id,
+            payload.batch_number,
+            payload.error_message,
+            payload.timestamp
+          );
+      } catch {}
     }
 
     if (this.mainWin && !this.mainWin.isDestroyed()) {

@@ -1,7 +1,7 @@
 import { app, BrowserWindow } from "electron";
 import { resolve } from "path";
 import { registerAccountHandlers } from "./ipc/accounts";
-import { registerExtractionHandlers } from "./ipc/extraction";
+import { registerExtractionHandlers, saveActiveExtraction } from "./ipc/extraction";
 import { registerFacebookHandlers } from "./ipc/facebook";
 import { initDB } from "./db/connection";
 
@@ -48,4 +48,8 @@ app.whenReady().then(() => {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+
+app.on("before-quit", (e) => {
+  saveActiveExtraction();
 });

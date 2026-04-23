@@ -1,9 +1,8 @@
 import { ipcMain, BrowserWindow } from "electron";
 import { GroupExtractor } from "../extraction/extractor";
-import { GroupScraper } from "../extraction/group-scraper";
+import { GroupScraper, getActiveScraper } from "../extraction/group-scraper";
 
 let activeExtractor: GroupExtractor | GroupScraper | null = null;
-let lastScraperRunId: number | null = null;
 
 export function registerExtractionHandlers() {
   ipcMain.handle(
@@ -22,9 +21,8 @@ export function registerExtractionHandlers() {
         const scraper = new GroupScraper(win);
         activeExtractor = scraper;
         const outputPath = await scraper.start(groupIds, accountId, resumeRunId);
-        lastScraperRunId = scraper.getRunId();
         activeExtractor = null;
-        return { outputPath, method: "scraper", runId: lastScraperRunId };
+        return { outputPath, method: "scraper", runId: scraper.getRunId() };
       }
 
       try {
@@ -41,9 +39,8 @@ export function registerExtractionHandlers() {
           const scraper = new GroupScraper(win);
           activeExtractor = scraper;
           const outputPath = await scraper.start(groupIds, accountId);
-          lastScraperRunId = scraper.getRunId();
           activeExtractor = null;
-          return { outputPath, method: "scraper", runId: lastScraperRunId };
+          return { outputPath, method: "scraper", runId: scraper.getRunId() };
         }
 
         activeExtractor = null;
@@ -66,9 +63,8 @@ export function registerExtractionHandlers() {
     const scraper = new GroupScraper(win);
     activeExtractor = scraper;
     const outputPath = await scraper.start([], 0, runId);
-    lastScraperRunId = scraper.getRunId();
     activeExtractor = null;
-    return { outputPath, method: "scraper", runId: lastScraperRunId };
+    return { outputPath, method: "scraper", runId: scraper.getRunId() };
   });
 
   ipcMain.handle("extraction:stopped-runs", async () => {
@@ -80,4 +76,14 @@ export function registerExtractionHandlers() {
       )
       .all();
   });
+}
+
+export function saveActiveExtraction() {
+  const scraper = getActiveScraper();
+  if (scraper && scraper.isRunning()) {
+    scraper.forceSave();
+  }
+  if (activeExtractor) {
+    activeExtractor.stop();
+  }
 }

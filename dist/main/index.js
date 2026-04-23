@@ -1243,6 +1243,12 @@ var MIN_DELAY_MS = 2e3;
 var MAX_DELAY_MS = 6e3;
 var MAX_NO_NEW = 30;
 var SCROLLS_PER_BATCH = 3;
+var MAX_RETRIES = 3;
+var RETRY_BASE_MS = 5e3;
+var globalScraper = null;
+function getActiveScraper() {
+	return globalScraper;
+}
 var GroupScraper = class {
 	mainWin;
 	abortFlag = false;
@@ -1252,6 +1258,12 @@ var GroupScraper = class {
 	scraperWindow = null;
 	accounts = [];
 	currentAccountIndex = 0;
+	currentGroupIndex = 0;
+	currentGroupId = "";
+	currentBatch = 0;
+	outputPath = "";
+	groupIds = [];
+	running = false;
 	constructor(win) {
 		this.mainWin = win;
 	}
@@ -1259,8 +1271,9 @@ var GroupScraper = class {
 		this.abortFlag = false;
 		this.totalExtracted = 0;
 		this.currentAccountIndex = 0;
+		this.running = true;
+		globalScraper = this;
 		const db = getDB();
-		let outputPath;
 		let startGroupIndex = 0;
 		let startBatch = 0;
 		const allValidIds = getValidAccountIds();
@@ -1275,11 +1288,12 @@ var GroupScraper = class {
 			};
 		});
 		if (resumeRunId) {
-			const run = db.prepare("SELECT output_path, group_ids, current_group_index, current_batch, members_extracted, scroll_position, last_account_id FROM extraction_runs WHERE id = ?").get(resumeRunId);
+			const run = db.prepare("SELECT output_path, group_ids, current_group_index, current_group_id, current_batch, members_extracted, last_account_id FROM extraction_runs WHERE id = ?").get(resumeRunId);
 			if (!run) throw new Error("Run " + resumeRunId + " not found");
-			outputPath = run.output_path;
+			this.outputPath = run.output_path;
 			groupIds = JSON.parse(run.group_ids);
 			startGroupIndex = run.current_group_index ?? 0;
+			this.currentGroupId = run.current_group_id ?? "";
 			startBatch = run.current_batch ?? 0;
 			this.totalExtracted = run.members_extracted ?? 0;
 			this.runId = resumeRunId;
@@ -1289,6 +1303,7 @@ var GroupScraper = class {
 			}
 			const existing = db.prepare("SELECT member_id FROM extraction_members WHERE run_id = ?").all(resumeRunId);
 			this.seenMemberIds = new Set(existing.map((r) => r.member_id));
+			this.rebuildCsvFromDb();
 		} else {
 			this.seenMemberIds.clear();
 			const { filePath } = await dialog.showSaveDialog(this.mainWin, {
@@ -1298,18 +1313,26 @@ var GroupScraper = class {
 					extensions: ["csv"]
 				}]
 			});
-			if (!filePath) throw new Error("No output path selected");
-			outputPath = filePath;
-			const result = db.prepare("INSERT INTO extraction_runs (group_ids, source_account_id, output_path) VALUES (?, ?, ?)").run(JSON.stringify(groupIds), accountId, outputPath);
+			if (!filePath) {
+				this.running = false;
+				globalScraper = null;
+				throw new Error("No output path selected");
+			}
+			this.outputPath = filePath;
+			const result = db.prepare("INSERT INTO extraction_runs (group_ids, source_account_id, output_path) VALUES (?, ?, ?)").run(JSON.stringify(groupIds), accountId, filePath);
 			this.runId = result.lastInsertRowid;
-			this.initializeCsv(outputPath);
+			this.initializeCsv(filePath);
 		}
+		this.groupIds = groupIds;
 		await this.initScraperWindow();
 		try {
 			for (let index = startGroupIndex; index < groupIds.length; index++) {
 				if (this.abortFlag) break;
 				const groupId = groupIds[index];
 				const batchStart = index === startGroupIndex ? startBatch : 0;
+				this.currentGroupIndex = index;
+				this.currentGroupId = groupId;
+				this.currentBatch = batchStart;
 				this.emitProgress({
 					current_group_id: groupId,
 					current_group_index: index,
@@ -1318,39 +1341,84 @@ var GroupScraper = class {
 					current_batch: batchStart,
 					status: "running"
 				});
-				await this.scrapeGroup(outputPath, groupId, index, groupIds.length, batchStart);
+				await this.scrapeGroup(groupId, index, groupIds.length, batchStart);
 			}
 		} finally {
+			this.running = false;
 			if (this.scraperWindow && !this.scraperWindow.isDestroyed()) {
 				this.scraperWindow.destroy();
 				this.scraperWindow = null;
 			}
+			globalScraper = null;
 		}
 		const finalStatus = this.abortFlag ? "stopped" : "completed";
 		if (this.runId) db.prepare("UPDATE extraction_runs SET status = ?, completed_at = datetime('now'), members_extracted = ? WHERE id = ?").run(finalStatus, this.totalExtracted, this.runId);
 		this.emitProgress({
-			current_group_id: groupIds[Math.max(0, groupIds.length - 1)] ?? "",
-			current_group_index: Math.max(0, groupIds.length - 1),
-			total_groups: groupIds.length,
+			current_group_id: this.groupIds[Math.max(0, this.groupIds.length - 1)] ?? "",
+			current_group_index: Math.max(0, this.groupIds.length - 1),
+			total_groups: this.groupIds.length,
 			members_extracted: this.totalExtracted,
 			current_batch: 0,
 			status: finalStatus
 		});
-		return outputPath;
+		return this.outputPath;
 	}
 	stop() {
 		this.abortFlag = true;
-		this.saveProgress();
+		this.persistState();
+	}
+	forceSave() {
+		this.persistState();
 	}
 	getRunId() {
 		return this.runId;
+	}
+	isRunning() {
+		return this.running;
+	}
+	getPersistedState() {
+		if (!this.runId) return null;
+		return {
+			runId: this.runId,
+			outputPath: this.outputPath,
+			groupIds: this.groupIds,
+			groupIndex: this.currentGroupIndex,
+			groupId: this.currentGroupId,
+			batch: this.currentBatch,
+			totalExtracted: this.totalExtracted,
+			accountIdIndex: this.currentAccountIndex
+		};
+	}
+	persistState() {
+		if (!this.runId) return;
+		getDB().prepare("UPDATE extraction_runs SET status = 'stopped', current_group_index = ?, current_group_id = ?, current_batch = ?, members_extracted = ?, last_account_id = ? WHERE id = ?").run(this.currentGroupIndex, this.currentGroupId, this.currentBatch, this.totalExtracted, this.accounts[this.currentAccountIndex]?.id ?? null, this.runId);
 	}
 	async initScraperWindow() {
 		if (this.scraperWindow && !this.scraperWindow.isDestroyed()) this.scraperWindow.destroy();
 		const account = this.accounts[this.currentAccountIndex];
 		const ses = session.fromPartition("persist:scraper");
 		ses.clearStorageData();
-		const cookies = await getSessionCookies(account.token);
+		let cookies;
+		let lastErr = null;
+		for (let attempt = 1; attempt <= 3; attempt++) try {
+			cookies = await getSessionCookies(account.token);
+			lastErr = null;
+			break;
+		} catch (err) {
+			lastErr = err instanceof Error ? err : new Error(String(err));
+			if (attempt < 3) {
+				this.emitProgress({
+					current_group_id: this.currentGroupId,
+					current_group_index: this.currentGroupIndex,
+					total_groups: this.groupIds.length,
+					members_extracted: this.totalExtracted,
+					current_batch: this.currentBatch,
+					status: "running"
+				});
+				await this.delay(5e3 * attempt);
+			}
+		}
+		if (lastErr) throw lastErr;
 		for (const cookie of cookies) await ses.cookies.set({
 			url: "https://www.facebook.com",
 			name: cookie.name,
@@ -1371,6 +1439,9 @@ var GroupScraper = class {
 			}
 		});
 		this.scraperWindow.webContents.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+		this.scraperWindow.on("close", (e) => {
+			e.preventDefault();
+		});
 	}
 	async rotateAccount() {
 		const nextIdx = this.accounts.findIndex((a, i) => i !== this.currentAccountIndex && a.failCount < 3);
@@ -1385,16 +1456,43 @@ var GroupScraper = class {
 			title: f
 		})) }).getHeaderString() ?? "", "utf8");
 	}
-	async scrapeGroup(outputPath, groupId, groupIndex, totalGroups, startBatch) {
+	rebuildCsvFromDb() {
+		if (!this.runId) return;
+		const db = getDB();
+		this.initializeCsv(this.outputPath);
+		const rows = db.prepare("SELECT member_id, group_id, extracted_at, source_account FROM extraction_members WHERE run_id = ? ORDER BY id").all(this.runId);
+		if (rows.length > 0) this.appendBatchToCsv(this.outputPath, rows);
+	}
+	async scrapeGroup(groupId, groupIndex, totalGroups, startBatch) {
 		const db = getDB();
 		const insertMember = db.prepare("INSERT OR IGNORE INTO extraction_members (run_id, member_id, group_id, group_name, extracted_at, source_account) VALUES (?, ?, ?, '', ?, ?)");
 		const groupUrl = "https://www.facebook.com/groups/" + encodeURIComponent(groupId) + "/members";
-		await this.loadPage(this.scraperWindow, groupUrl);
-		await this.delay(3e3);
+		let retries = 0;
+		while (retries < MAX_RETRIES) try {
+			const win = this.scraperWindow;
+			if (!win || win.isDestroyed()) await this.initScraperWindow();
+			await this.loadPage(this.scraperWindow, groupUrl);
+			await this.delay(3e3);
+			break;
+		} catch (err) {
+			retries++;
+			if (retries >= MAX_RETRIES) {
+				this.recordError(groupId, startBatch, err);
+				return;
+			}
+			this.recordError(groupId, startBatch, /* @__PURE__ */ new Error("Page load failed (retry " + retries + "/3), waiting..."));
+			await this.delay(RETRY_BASE_MS * retries);
+		}
 		if (startBatch > 0) {
 			for (let i = 0; i < startBatch; i++) {
-				if (this.scraperWindow && !this.scraperWindow.isDestroyed()) await this.scraperWindow.webContents.executeJavaScript(SCROLL_JS);
-				await this.delay(500);
+				const win = this.scraperWindow;
+				if (!win || win.isDestroyed()) break;
+				try {
+					await win.webContents.executeJavaScript(SCROLL_JS);
+					await this.delay(400);
+				} catch {
+					break;
+				}
 			}
 			await this.delay(2e3);
 		}
@@ -1402,24 +1500,38 @@ var GroupScraper = class {
 		let noNewCount = 0;
 		let extractCount = 0;
 		let prevVisibleCount = 0;
+		let consecutiveErrors = 0;
 		while (!this.abortFlag) {
 			currentBatch++;
+			this.currentBatch = currentBatch;
 			try {
 				const win = this.scraperWindow;
-				if (!win || win.isDestroyed()) break;
+				if (!win || win.isDestroyed()) {
+					await this.initScraperWindow();
+					await this.loadPage(this.scraperWindow, groupUrl);
+					await this.delay(3e3);
+					prevVisibleCount = 0;
+					continue;
+				}
 				for (let s = 0; s < SCROLLS_PER_BATCH; s++) {
 					await win.webContents.executeJavaScript(SCROLL_JS);
 					await this.delay(600);
 				}
 				await win.webContents.executeJavaScript("window.scrollTo(0, document.body.scrollHeight);");
-				prevVisibleCount = await win.webContents.executeJavaScript(WAIT_FOR_NEW_JS + String(prevVisibleCount) + ");");
+				try {
+					prevVisibleCount = await win.webContents.executeJavaScript(WAIT_FOR_NEW_JS + String(prevVisibleCount) + ");");
+				} catch {
+					await this.delay(2e3);
+				}
 				const blockInfo = await win.webContents.executeJavaScript(CHECK_BLOCK_JS);
 				if (blockInfo.isLogin || blockInfo.isBlock || blockInfo.isCaptcha) {
 					this.accounts[this.currentAccountIndex].failCount++;
 					const reason = blockInfo.isCaptcha ? "Captcha detected" : blockInfo.isBlock ? "Account blocked/restricted" : "Session expired (login page)";
 					this.recordError(groupId, currentBatch, /* @__PURE__ */ new Error(reason + " — account: " + this.accounts[this.currentAccountIndex].name));
+					this.persistState();
 					if (!await this.rotateAccount()) {
-						this.recordError(groupId, currentBatch, /* @__PURE__ */ new Error("All accounts blocked or expired"));
+						this.recordError(groupId, currentBatch, /* @__PURE__ */ new Error("All accounts blocked or expired. Stopping — resume later."));
+						this.persistState();
 						break;
 					}
 					await this.loadPage(this.scraperWindow, groupUrl);
@@ -1437,6 +1549,7 @@ var GroupScraper = class {
 				if (newIds.length > 0) {
 					noNewCount = 0;
 					extractCount += newIds.length;
+					consecutiveErrors = 0;
 					if (!this.runId) throw new Error("Extraction run not initialized");
 					const now = (/* @__PURE__ */ new Date()).toISOString();
 					const accountName = this.accounts[this.currentAccountIndex].name;
@@ -1449,7 +1562,7 @@ var GroupScraper = class {
 						extracted_at: now,
 						source_account: accountName
 					}));
-					this.appendBatchToCsv(outputPath, rows);
+					this.appendBatchToCsv(this.outputPath, rows);
 					this.totalExtracted += newIds.length;
 				} else noNewCount++;
 				if (extractCount >= MEMORY_FLUSH_INTERVAL) {
@@ -1466,20 +1579,41 @@ var GroupScraper = class {
 					current_batch: currentBatch,
 					status: "running"
 				});
-				if (currentBatch % 5 === 0) this.saveRunProgress(groupIndex, groupId, currentBatch);
+				this.persistState();
 				if (noNewCount >= MAX_NO_NEW) break;
 				await this.randomDelay();
 			} catch (error) {
+				consecutiveErrors++;
 				this.recordError(groupId, currentBatch, error);
-				if (!await this.rotateAccount()) break;
-				if (this.scraperWindow && !this.scraperWindow.isDestroyed()) {
+				if (consecutiveErrors >= 5) {
+					this.recordError(groupId, currentBatch, /* @__PURE__ */ new Error("Too many consecutive errors (" + consecutiveErrors + "). Saving progress — resume later."));
+					this.persistState();
+					break;
+				}
+				this.persistState();
+				await this.delay(RETRY_BASE_MS * Math.min(consecutiveErrors, 3));
+				const win = this.scraperWindow;
+				if (!win || win.isDestroyed()) try {
+					await this.initScraperWindow();
 					await this.loadPage(this.scraperWindow, groupUrl);
 					await this.delay(3e3);
+				} catch {
+					this.recordError(groupId, currentBatch, /* @__PURE__ */ new Error("Failed to recover window. Saving progress."));
+					this.persistState();
+					break;
+				}
+				else try {
+					await this.loadPage(win, groupUrl);
+					await this.delay(3e3);
+				} catch {
+					this.recordError(groupId, currentBatch, /* @__PURE__ */ new Error("Page reload failed. Saving progress."));
+					this.persistState();
+					break;
 				}
 				prevVisibleCount = 0;
 			}
 		}
-		this.saveRunProgress(groupIndex, groupId, currentBatch);
+		this.persistState();
 	}
 	async loadPage(scraper, url) {
 		try {
@@ -1499,14 +1633,6 @@ var GroupScraper = class {
 			});
 		}
 	}
-	saveRunProgress(groupIndex, groupId, batch) {
-		if (!this.runId) return;
-		getDB().prepare("UPDATE extraction_runs SET current_group_index = ?, current_group_id = ?, current_batch = ?, members_extracted = ?, scroll_position = ?, last_account_id = ? WHERE id = ?").run(groupIndex, groupId, batch, this.totalExtracted, batch * 3e3, this.accounts[this.currentAccountIndex].id, this.runId);
-	}
-	saveProgress() {
-		if (!this.runId) return;
-		getDB().prepare("UPDATE extraction_runs SET status = 'stopped', members_extracted = ?, last_account_id = ? WHERE id = ?").run(this.totalExtracted, this.accounts[this.currentAccountIndex].id, this.runId);
-	}
 	appendBatchToCsv(outputPath, rows) {
 		appendFileSync(outputPath, (0, import_dist.createObjectCsvStringifier)({ header: CSV_ID_FIELDS.map((f) => ({
 			id: f,
@@ -1520,7 +1646,9 @@ var GroupScraper = class {
 			error_message: error instanceof Error ? error.message : String(error),
 			timestamp: (/* @__PURE__ */ new Date()).toISOString()
 		};
-		if (this.runId) getDB().prepare("INSERT INTO extraction_errors (run_id, group_id, batch_number, error_message, timestamp) VALUES (?, ?, ?, ?, ?)").run(this.runId, payload.group_id, payload.batch_number, payload.error_message, payload.timestamp);
+		if (this.runId) try {
+			getDB().prepare("INSERT INTO extraction_errors (run_id, group_id, batch_number, error_message, timestamp) VALUES (?, ?, ?, ?, ?)").run(this.runId, payload.group_id, payload.batch_number, payload.error_message, payload.timestamp);
+		} catch {}
 		if (this.mainWin && !this.mainWin.isDestroyed()) this.mainWin.webContents.send("extraction:error", payload);
 	}
 	randomDelay() {
@@ -1540,7 +1668,6 @@ var GroupScraper = class {
 //#endregion
 //#region src/main/ipc/extraction.ts
 var activeExtractor = null;
-var lastScraperRunId = null;
 function registerExtractionHandlers() {
 	ipcMain.handle("extraction:start", async (_event, groupIds, accountId, useScraper = false, resumeRunId = null) => {
 		const win = BrowserWindow.getAllWindows()[0];
@@ -1549,12 +1676,11 @@ function registerExtractionHandlers() {
 			const scraper = new GroupScraper(win);
 			activeExtractor = scraper;
 			const outputPath = await scraper.start(groupIds, accountId, resumeRunId);
-			lastScraperRunId = scraper.getRunId();
 			activeExtractor = null;
 			return {
 				outputPath,
 				method: "scraper",
-				runId: lastScraperRunId
+				runId: scraper.getRunId()
 			};
 		}
 		try {
@@ -1571,12 +1697,11 @@ function registerExtractionHandlers() {
 				const scraper = new GroupScraper(win);
 				activeExtractor = scraper;
 				const outputPath = await scraper.start(groupIds, accountId);
-				lastScraperRunId = scraper.getRunId();
 				activeExtractor = null;
 				return {
 					outputPath,
 					method: "scraper",
-					runId: lastScraperRunId
+					runId: scraper.getRunId()
 				};
 			}
 			activeExtractor = null;
@@ -1593,18 +1718,22 @@ function registerExtractionHandlers() {
 		const scraper = new GroupScraper(win);
 		activeExtractor = scraper;
 		const outputPath = await scraper.start([], 0, runId);
-		lastScraperRunId = scraper.getRunId();
 		activeExtractor = null;
 		return {
 			outputPath,
 			method: "scraper",
-			runId: lastScraperRunId
+			runId: scraper.getRunId()
 		};
 	});
 	ipcMain.handle("extraction:stopped-runs", async () => {
 		const { getDB } = (init_connection(), __toCommonJS(connection_exports));
 		return getDB().prepare("SELECT id, group_ids, members_extracted, current_group_index, current_batch, started_at, output_path FROM extraction_runs WHERE status = 'stopped' ORDER BY started_at DESC LIMIT 20").all();
 	});
+}
+function saveActiveExtraction() {
+	const scraper = getActiveScraper();
+	if (scraper && scraper.isRunning()) scraper.forceSave();
+	if (activeExtractor) activeExtractor.stop();
 }
 //#endregion
 //#region src/main/ipc/facebook.ts
@@ -1651,6 +1780,9 @@ app.whenReady().then(() => {
 });
 app.on("window-all-closed", () => {
 	if (process.platform !== "darwin") app.quit();
+});
+app.on("before-quit", (e) => {
+	saveActiveExtraction();
 });
 //#endregion
 export {};
