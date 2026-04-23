@@ -25,6 +25,11 @@ export function createTables(db: Database.Database) {
       completed_at TEXT,
       output_path TEXT NOT NULL,
       members_extracted INTEGER DEFAULT 0,
+      current_group_index INTEGER DEFAULT 0,
+      current_group_id TEXT,
+      current_batch INTEGER DEFAULT 0,
+      scroll_position INTEGER DEFAULT 0,
+      last_account_id INTEGER,
       FOREIGN KEY (source_account_id) REFERENCES accounts(id) ON DELETE CASCADE
     );
 

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Account, ExtractionProgress, ExtractionError } from "@shared/types";
+import type { StoppedRun } from "../types";
 
 export default function GroupExtractor() {
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -9,6 +10,7 @@ export default function GroupExtractor() {
   const [errors, setErrors] = useState<ExtractionError[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [useScraper, setUseScraper] = useState(false);
+  const [stoppedRuns, setStoppedRuns] = useState<StoppedRun[]>([]);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
   const errorLogRef = useRef<HTMLDivElement>(null);
 
@@ -16,20 +18,27 @@ export default function GroupExtractor() {
     try {
       const list = await window.api.accounts.list();
       setAccounts(list.filter((a) => a.status === "Valid"));
-    } catch {
-      // ignore
-    }
+    } catch {}
+  }, []);
+
+  const loadStoppedRuns = useCallback(async () => {
+    try {
+      const runs = await window.api.extraction.stoppedRuns();
+      setStoppedRuns(runs);
+    } catch {}
   }, []);
 
   useEffect(() => {
     loadAccounts();
-  }, [loadAccounts]);
+    loadStoppedRuns();
+  }, [loadAccounts, loadStoppedRuns]);
 
   useEffect(() => {
     const unsubProgress = window.api.extraction.onProgress((p) => {
       setProgress(p);
       if (p.status === "completed" || p.status === "stopped" || p.status === "failed") {
         setIsRunning(false);
+        loadStoppedRuns();
       }
     });
 
@@ -41,7 +50,7 @@ export default function GroupExtractor() {
       unsubProgress();
       unsubError();
     };
-  }, []);
+  }, [loadStoppedRuns]);
 
   useEffect(() => {
     if (errorLogRef.current) {
@@ -66,21 +75,36 @@ export default function GroupExtractor() {
 
     setIsRunning(true);
     setErrors([]);
-      setProgress({
-        current_group_id: groupIds[0] ?? "",
-        current_group_index: 0,
-        total_groups: groupIds.length,
-        members_extracted: 0,
-        current_batch: 0,
-        status: "running",
-      });
+    setProgress({
+      current_group_id: groupIds[0] ?? "",
+      current_group_index: 0,
+      total_groups: groupIds.length,
+      members_extracted: 0,
+      current_batch: 0,
+      status: "running",
+    });
 
     showMessage("Extraction started", "success");
     window.api.extraction
       .start(groupIds, selectedAccountId, useScraper)
       .then(({ outputPath, method }) => {
         const methodLabel = method === "scraper" ? " (via web scraping)" : "";
-        showMessage(`Extraction finished${methodLabel}: ${outputPath}`, "success");
+        showMessage("Extraction finished" + methodLabel + ": " + outputPath, "success");
+      })
+      .catch((err: any) => {
+        showMessage(err.message, "error");
+        setIsRunning(false);
+      });
+  };
+
+  const handleResume = async (run: StoppedRun) => {
+    setIsRunning(true);
+    setErrors([]);
+    showMessage("Resuming extraction...", "success");
+    window.api.extraction
+      .resumeRun(run.id)
+      .then(({ outputPath }) => {
+        showMessage("Extraction resumed and finished: " + outputPath, "success");
       })
       .catch((err: any) => {
         showMessage(err.message, "error");
@@ -95,7 +119,7 @@ export default function GroupExtractor() {
 
   const showMessage = (text: string, type: "success" | "error") => {
     setMessage({ text, type });
-    setTimeout(() => setMessage(null), 3000);
+    setTimeout(() => setMessage(null), 4000);
   };
 
   const progressPercent =
@@ -145,6 +169,11 @@ export default function GroupExtractor() {
               </option>
             ))}
           </select>
+          {accounts.length > 1 && (
+            <p className="mt-1 text-xs text-blue-600">
+              {accounts.length} valid accounts available — auto-rotation enabled for scraper mode
+            </p>
+          )}
           {accounts.length === 0 && (
             <p className="mt-1 text-xs text-gray-400">
               No valid accounts. Add and validate tokens in Account Manager first.
@@ -186,6 +215,35 @@ export default function GroupExtractor() {
         </div>
       </div>
 
+      {stoppedRuns.length > 0 && !isRunning && (
+        <div className="bg-white border border-gray-200 rounded-lg p-4 mb-4">
+          <h3 className="text-sm font-medium text-gray-700 mb-3">Resume Previous Runs</h3>
+          <div className="space-y-2">
+            {stoppedRuns.map((run) => (
+              <div key={run.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-md">
+                <div className="text-sm">
+                  <span className="font-medium text-gray-800">Run #{run.id}</span>
+                  <span className="text-gray-500 mx-2">—</span>
+                  <span className="text-gray-600">
+                    {JSON.parse(run.group_ids).length} group(s),
+                    {" "}{run.members_extracted} extracted,
+                    {" "}batch #{run.current_batch}
+                  </span>
+                  <span className="text-gray-400 mx-2">|</span>
+                  <span className="text-gray-400 text-xs">{new Date(run.started_at).toLocaleString()}</span>
+                </div>
+                <button
+                  onClick={() => handleResume(run)}
+                  className="px-3 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700"
+                >
+                  Resume
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {progress && (
         <div className="bg-white border border-gray-200 rounded-lg p-4 mb-4">
           <h3 className="text-sm font-medium text-gray-700 mb-3">Progress</h3>
@@ -204,15 +262,15 @@ export default function GroupExtractor() {
             }`}
           >
             {progress.status === "running" &&
-              `Extracting group ${progress.current_group_index + 1} of ${progress.total_groups}...`}
+              "Extracting group " + (progress.current_group_index + 1) + " of " + progress.total_groups + "..."}
             {progress.status === "failed" &&
               "Extraction failed. Facebook denied access or another extraction error occurred."}
             {progress.status === "completed" &&
               (hasExtractedMembers
-                ? `Extraction completed. Extracted ${progress.members_extracted} member${progress.members_extracted === 1 ? "" : "s"}.`
+                ? "Extraction completed. Extracted " + progress.members_extracted + " member" + (progress.members_extracted === 1 ? "" : "s") + "."
                 : "Extraction completed, but no members were extracted.")}
             {progress.status === "stopped" &&
-              `Extraction stopped. Extracted ${progress.members_extracted} member${progress.members_extracted === 1 ? "" : "s"}.`}
+              "Extraction stopped. Extracted " + progress.members_extracted + " member" + (progress.members_extracted === 1 ? "" : "s") + ". Use Resume to continue."}
           </div>
 
           <div className="grid grid-cols-2 gap-2 text-sm mb-3">
@@ -239,7 +297,7 @@ export default function GroupExtractor() {
           <div className="w-full bg-gray-200 rounded-full h-2">
             <div
               className="bg-blue-600 h-2 rounded-full transition-all duration-300"
-              style={{ width: `${progressPercent}%` }}
+              style={{ width: progressPercent + "%" }}
             />
           </div>
           <p className="text-xs text-gray-400 mt-1">{progressPercent}%</p>

@@ -11,6 +11,8 @@ electron.contextBridge.exposeInMainWorld("api", {
 	extraction: {
 		start: (groupIds, accountId, useScraper) => electron.ipcRenderer.invoke("extraction:start", groupIds, accountId, useScraper),
 		stop: () => electron.ipcRenderer.invoke("extraction:stop"),
+		resumeRun: (runId) => electron.ipcRenderer.invoke("extraction:resume-run", runId),
+		stoppedRuns: () => electron.ipcRenderer.invoke("extraction:stopped-runs"),
 		onProgress: (callback) => {
 			electron.ipcRenderer.on("extraction:progress", (_event, data) => callback(data));
 			return () => electron.ipcRenderer.removeAllListeners("extraction:progress");

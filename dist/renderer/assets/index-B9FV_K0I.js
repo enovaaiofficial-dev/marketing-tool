@@ -10201,6 +10201,7 @@ function GroupExtractor() {
 	const [errors, setErrors] = (0, import_react.useState)([]);
 	const [isRunning, setIsRunning] = (0, import_react.useState)(false);
 	const [useScraper, setUseScraper] = (0, import_react.useState)(false);
+	const [stoppedRuns, setStoppedRuns] = (0, import_react.useState)([]);
 	const [message, setMessage] = (0, import_react.useState)(null);
 	const errorLogRef = (0, import_react.useRef)(null);
 	const loadAccounts = (0, import_react.useCallback)(async () => {
@@ -10208,13 +10209,22 @@ function GroupExtractor() {
 			setAccounts((await window.api.accounts.list()).filter((a) => a.status === "Valid"));
 		} catch {}
 	}, []);
+	const loadStoppedRuns = (0, import_react.useCallback)(async () => {
+		try {
+			setStoppedRuns(await window.api.extraction.stoppedRuns());
+		} catch {}
+	}, []);
 	(0, import_react.useEffect)(() => {
 		loadAccounts();
-	}, [loadAccounts]);
+		loadStoppedRuns();
+	}, [loadAccounts, loadStoppedRuns]);
 	(0, import_react.useEffect)(() => {
 		const unsubProgress = window.api.extraction.onProgress((p) => {
 			setProgress(p);
-			if (p.status === "completed" || p.status === "stopped" || p.status === "failed") setIsRunning(false);
+			if (p.status === "completed" || p.status === "stopped" || p.status === "failed") {
+				setIsRunning(false);
+				loadStoppedRuns();
+			}
 		});
 		const unsubError = window.api.extraction.onError((e) => {
 			setErrors((prev) => [...prev, e]);
@@ -10223,7 +10233,7 @@ function GroupExtractor() {
 			unsubProgress();
 			unsubError();
 		};
-	}, []);
+	}, [loadStoppedRuns]);
 	(0, import_react.useEffect)(() => {
 		if (errorLogRef.current) errorLogRef.current.scrollTop = errorLogRef.current.scrollHeight;
 	}, [errors]);
@@ -10249,7 +10259,18 @@ function GroupExtractor() {
 		});
 		showMessage("Extraction started", "success");
 		window.api.extraction.start(groupIds, selectedAccountId, useScraper).then(({ outputPath, method }) => {
-			showMessage(`Extraction finished${method === "scraper" ? " (via web scraping)" : ""}: ${outputPath}`, "success");
+			showMessage("Extraction finished" + (method === "scraper" ? " (via web scraping)" : "") + ": " + outputPath, "success");
+		}).catch((err) => {
+			showMessage(err.message, "error");
+			setIsRunning(false);
+		});
+	};
+	const handleResume = async (run) => {
+		setIsRunning(true);
+		setErrors([]);
+		showMessage("Resuming extraction...", "success");
+		window.api.extraction.resumeRun(run.id).then(({ outputPath }) => {
+			showMessage("Extraction resumed and finished: " + outputPath, "success");
 		}).catch((err) => {
 			showMessage(err.message, "error");
 			setIsRunning(false);
@@ -10264,7 +10285,7 @@ function GroupExtractor() {
 			text,
 			type
 		});
-		setTimeout(() => setMessage(null), 3e3);
+		setTimeout(() => setMessage(null), 4e3);
 	};
 	const progressPercent = progress && progress.total_groups > 0 ? Math.round((progress.current_group_index + 1) / progress.total_groups * 100) : 0;
 	const hasExtractedMembers = (progress?.members_extracted ?? 0) > 0;
@@ -10315,6 +10336,10 @@ function GroupExtractor() {
 								]
 							}, a.id))]
 						}),
+						accounts.length > 1 && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
+							className: "mt-1 text-xs text-blue-600",
+							children: [accounts.length, " valid accounts available — auto-rotation enabled for scraper mode"]
+						}),
 						accounts.length === 0 && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
 							className: "mt-1 text-xs text-gray-400",
 							children: "No valid accounts. Add and validate tokens in Account Manager first."
@@ -10354,6 +10379,56 @@ function GroupExtractor() {
 					})
 				]
 			}),
+			stoppedRuns.length > 0 && !isRunning && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+				className: "bg-white border border-gray-200 rounded-lg p-4 mb-4",
+				children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", {
+					className: "text-sm font-medium text-gray-700 mb-3",
+					children: "Resume Previous Runs"
+				}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+					className: "space-y-2",
+					children: stoppedRuns.map((run) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: "flex items-center justify-between p-3 bg-gray-50 rounded-md",
+						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "text-sm",
+							children: [
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+									className: "font-medium text-gray-800",
+									children: ["Run #", run.id]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+									className: "text-gray-500 mx-2",
+									children: "—"
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", {
+									className: "text-gray-600",
+									children: [
+										JSON.parse(run.group_ids).length,
+										" group(s),",
+										" ",
+										run.members_extracted,
+										" extracted,",
+										" ",
+										"batch #",
+										run.current_batch
+									]
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+									className: "text-gray-400 mx-2",
+									children: "|"
+								}),
+								/* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", {
+									className: "text-gray-400 text-xs",
+									children: new Date(run.started_at).toLocaleString()
+								})
+							]
+						}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
+							onClick: () => handleResume(run),
+							className: "px-3 py-1 bg-green-600 text-white text-xs rounded hover:bg-green-700",
+							children: "Resume"
+						})]
+					}, run.id))
+				})]
+			}),
 			progress && /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 				className: "bg-white border border-gray-200 rounded-lg p-4 mb-4",
 				children: [
@@ -10364,10 +10439,10 @@ function GroupExtractor() {
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: `mb-3 rounded-md px-3 py-2 text-sm ${progress.status === "running" ? "bg-blue-50 text-blue-700" : progress.status === "failed" ? "bg-red-50 text-red-700" : hasExtractedMembers ? "bg-green-50 text-green-700" : errors.length > 0 ? "bg-red-50 text-red-700" : "bg-yellow-50 text-yellow-700"}`,
 						children: [
-							progress.status === "running" && `Extracting group ${progress.current_group_index + 1} of ${progress.total_groups}...`,
+							progress.status === "running" && "Extracting group " + (progress.current_group_index + 1) + " of " + progress.total_groups + "...",
 							progress.status === "failed" && "Extraction failed. Facebook denied access or another extraction error occurred.",
-							progress.status === "completed" && (hasExtractedMembers ? `Extraction completed. Extracted ${progress.members_extracted} member${progress.members_extracted === 1 ? "" : "s"}.` : "Extraction completed, but no members were extracted."),
-							progress.status === "stopped" && `Extraction stopped. Extracted ${progress.members_extracted} member${progress.members_extracted === 1 ? "" : "s"}.`
+							progress.status === "completed" && (hasExtractedMembers ? "Extraction completed. Extracted " + progress.members_extracted + " member" + (progress.members_extracted === 1 ? "" : "s") + "." : "Extraction completed, but no members were extracted."),
+							progress.status === "stopped" && "Extraction stopped. Extracted " + progress.members_extracted + " member" + (progress.members_extracted === 1 ? "" : "s") + ". Use Resume to continue."
 						]
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
@@ -10427,7 +10502,7 @@ function GroupExtractor() {
 						className: "w-full bg-gray-200 rounded-full h-2",
 						children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
 							className: "bg-blue-600 h-2 rounded-full transition-all duration-300",
-							style: { width: `${progressPercent}%` }
+							style: { width: progressPercent + "%" }
 						})
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {

@@ -13,6 +13,8 @@ const api = {
     start: (groupIds: string[], accountId: number, useScraper?: boolean) =>
       ipcRenderer.invoke("extraction:start", groupIds, accountId, useScraper),
     stop: () => ipcRenderer.invoke("extraction:stop"),
+    resumeRun: (runId: number) => ipcRenderer.invoke("extraction:resume-run", runId),
+    stoppedRuns: () => ipcRenderer.invoke("extraction:stopped-runs"),
     onProgress: (callback: (progress: any) => void) => {
       ipcRenderer.on("extraction:progress", (_event, data) => callback(data));
       return () => ipcRenderer.removeAllListeners("extraction:progress");

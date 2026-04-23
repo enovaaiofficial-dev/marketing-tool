@@ -116,3 +116,9 @@ export function getAccountsForValidation(ids?: number[]): any[] {
   }
   return db.prepare("SELECT id, token_encrypted, token_iv FROM accounts").all();
 }
+
+export function getValidAccountIds(): number[] {
+  const db = getDB();
+  const rows = db.prepare("SELECT id FROM accounts WHERE status = 'Valid' ORDER BY id").all() as any[];
+  return rows.map((r) => r.id);
+}
