@@ -8,6 +8,7 @@ export default function GroupExtractor() {
   const [progress, setProgress] = useState<ExtractionProgress | null>(null);
   const [errors, setErrors] = useState<ExtractionError[]>([]);
   const [isRunning, setIsRunning] = useState(false);
+  const [useScraper, setUseScraper] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
   const errorLogRef = useRef<HTMLDivElement>(null);
 
@@ -27,7 +28,7 @@ export default function GroupExtractor() {
   useEffect(() => {
     const unsubProgress = window.api.extraction.onProgress((p) => {
       setProgress(p);
-      if (p.status === "completed" || p.status === "stopped") {
+      if (p.status === "completed" || p.status === "stopped" || p.status === "failed") {
         setIsRunning(false);
       }
     });
@@ -65,13 +66,21 @@ export default function GroupExtractor() {
 
     setIsRunning(true);
     setErrors([]);
-    setProgress(null);
+      setProgress({
+        current_group_id: groupIds[0] ?? "",
+        current_group_index: 0,
+        total_groups: groupIds.length,
+        members_extracted: 0,
+        current_batch: 0,
+        status: "running",
+      });
 
     showMessage("Extraction started", "success");
     window.api.extraction
-      .start(groupIds, selectedAccountId)
-      .then(({ outputPath }) => {
-        showMessage(`Extraction finished: ${outputPath}`, "success");
+      .start(groupIds, selectedAccountId, useScraper)
+      .then(({ outputPath, method }) => {
+        const methodLabel = method === "scraper" ? " (via web scraping)" : "";
+        showMessage(`Extraction finished${methodLabel}: ${outputPath}`, "success");
       })
       .catch((err: any) => {
         showMessage(err.message, "error");
@@ -93,6 +102,7 @@ export default function GroupExtractor() {
     progress && progress.total_groups > 0
       ? Math.round(((progress.current_group_index + 1) / progress.total_groups) * 100)
       : 0;
+  const hasExtractedMembers = (progress?.members_extracted ?? 0) > 0;
 
   return (
     <div className="p-6 max-w-5xl">
@@ -142,6 +152,22 @@ export default function GroupExtractor() {
           )}
         </div>
 
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="useScraper"
+              checked={useScraper}
+              onChange={(e) => setUseScraper(e.target.checked)}
+              disabled={isRunning}
+              className="h-4 w-4 rounded border-gray-300 text-blue-600"
+            />
+            <label htmlFor="useScraper" className="text-sm text-gray-700">
+              Use web scraping (bypasses API permission requirement)
+            </label>
+          </div>
+        </div>
+
         <div className="flex gap-2">
           <button
             onClick={handleStart}
@@ -163,6 +189,31 @@ export default function GroupExtractor() {
       {progress && (
         <div className="bg-white border border-gray-200 rounded-lg p-4 mb-4">
           <h3 className="text-sm font-medium text-gray-700 mb-3">Progress</h3>
+
+          <div
+            className={`mb-3 rounded-md px-3 py-2 text-sm ${
+              progress.status === "running"
+                ? "bg-blue-50 text-blue-700"
+                : progress.status === "failed"
+                  ? "bg-red-50 text-red-700"
+                : hasExtractedMembers
+                  ? "bg-green-50 text-green-700"
+                  : errors.length > 0
+                    ? "bg-red-50 text-red-700"
+                    : "bg-yellow-50 text-yellow-700"
+            }`}
+          >
+            {progress.status === "running" &&
+              `Extracting group ${progress.current_group_index + 1} of ${progress.total_groups}...`}
+            {progress.status === "failed" &&
+              "Extraction failed. Facebook denied access or another extraction error occurred."}
+            {progress.status === "completed" &&
+              (hasExtractedMembers
+                ? `Extraction completed. Extracted ${progress.members_extracted} member${progress.members_extracted === 1 ? "" : "s"}.`
+                : "Extraction completed, but no members were extracted.")}
+            {progress.status === "stopped" &&
+              `Extraction stopped. Extracted ${progress.members_extracted} member${progress.members_extracted === 1 ? "" : "s"}.`}
+          </div>
 
           <div className="grid grid-cols-2 gap-2 text-sm mb-3">
             <div>
@@ -192,6 +243,12 @@ export default function GroupExtractor() {
             />
           </div>
           <p className="text-xs text-gray-400 mt-1">{progressPercent}%</p>
+
+          {progress.status !== "running" && progress.status !== "failed" && !hasExtractedMembers && (
+            <p className="text-xs text-gray-500 mt-2">
+              No member rows were written to the CSV for this run.
+            </p>
+          )}
         </div>
       )}
 

@@ -9,7 +9,7 @@ export interface ElectronAPI {
     export: () => Promise<{ path: string }>;
   };
   extraction: {
-    start: (groupIds: string[], accountId: number) => Promise<{ outputPath: string }>;
+    start: (groupIds: string[], accountId: number, useScraper?: boolean) => Promise<{ outputPath: string; method?: string }>;
     stop: () => Promise<{ stopped: boolean }>;
     onProgress: (callback: (progress: ExtractionProgress) => void) => () => void;
     onError: (callback: (error: ExtractionError) => void) => () => void;

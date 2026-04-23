@@ -10,8 +10,8 @@ const api = {
     export: () => ipcRenderer.invoke("account:export"),
   },
   extraction: {
-    start: (groupIds: string[], accountId: number) =>
-      ipcRenderer.invoke("extraction:start", groupIds, accountId),
+    start: (groupIds: string[], accountId: number, useScraper?: boolean) =>
+      ipcRenderer.invoke("extraction:start", groupIds, accountId, useScraper),
     stop: () => ipcRenderer.invoke("extraction:stop"),
     onProgress: (callback: (progress: any) => void) => {
       ipcRenderer.on("extraction:progress", (_event, data) => callback(data));

@@ -1,9 +1,9 @@
 import { createRequire } from "node:module";
 import { BrowserWindow, app, dialog, ipcMain, session } from "electron";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import Database from "better-sqlite3";
 import { createCipheriv, createDecipheriv, randomBytes } from "crypto";
-import { appendFileSync, writeFileSync } from "fs";
+import { appendFileSync, mkdirSync, writeFileSync } from "fs";
 // -- CommonJS Shims --
 import __cjs_mod__ from "node:module";
 import.meta.filename;
@@ -195,11 +195,52 @@ function getAccountsForValidation(ids) {
 //#endregion
 //#region src/main/api/platform-client.ts
 var GRAPH_API = "https://graph.facebook.com/v21.0";
+function buildMemberPage(data, paging) {
+	const members = (data ?? []).map((m) => ({
+		id: m.id,
+		name: m.name ?? "",
+		link: m.link ?? `https://www.facebook.com/${m.id}`
+	}));
+	const nextPageLink = paging?.next ?? null;
+	const nextCursor = paging?.cursors?.after ?? null;
+	const hasMore = !!nextPageLink || !!nextCursor;
+	return {
+		members,
+		hasMore,
+		nextCursor: hasMore ? nextCursor : null,
+		nextPageUrl: hasMore ? nextPageLink : null
+	};
+}
+function shouldRetryWithMembersField(error) {
+	if (!error || error.code !== 100) return false;
+	const msg = error.message?.toLowerCase() ?? "";
+	return msg.includes("nonexisting field") && msg.includes("members");
+}
+function extractAfterCursor(url) {
+	if (!url) return null;
+	try {
+		return new URL(url).searchParams.get("after");
+	} catch {
+		return null;
+	}
+}
+function buildMembersFieldUrl(token, groupId, limit, afterCursor) {
+	const fields = afterCursor ? `members.after(${afterCursor}).limit(${limit}){id,name,link}` : `members.limit(${limit}){id,name,link}`;
+	return `${GRAPH_API}/${encodeURIComponent(groupId)}?fields=${encodeURIComponent(fields)}&access_token=${encodeURIComponent(token)}`;
+}
 function classifyStatus(error) {
 	if (error.error_subcode === 463 || error.error_subcode === 467) return "Expired";
+	if (error.code === 190 && (error.message?.toLowerCase().includes("checkpoint") || error.message?.toLowerCase().includes("logged-in"))) return "Blocked";
 	if (error.code === 10 || error.code === 100 || error.code === 190) return "Invalid";
 	if (error.error_subcode === 368 || error.code === 368 || error.message?.toLowerCase().includes("blocked")) return "Blocked";
 	return "Invalid";
+}
+function formatGraphError(error, context, groupId) {
+	if (context === "group-members" && error.code === 10) return `Token is valid for login, but Facebook denied access to members of group ${groupId} (code 10). The selected account does not have permission to read this group's member list.`;
+	if (context === "group-members" && error.code === 190) return `Facebook rejected the token while reading members for group ${groupId} (code 190). Re-login, pass any checkpoint, then validate the token again.`;
+	if (context === "group-members" && error.code === 100) return `Facebook does not allow the requested members endpoint for group ${groupId} (code 100). The token or app context cannot access this group's member list.`;
+	if (context === "group-info" && error.code === 10) return `Facebook denied access to group ${groupId} metadata (code 10). The selected account may not be allowed to access this group.`;
+	return `[${error.code}] ${error.message}`;
 }
 async function validateToken(token) {
 	try {
@@ -224,27 +265,30 @@ async function validateToken(token) {
 async function fetchGroupInfo(token, groupId) {
 	try {
 		const data = await (await fetch(`${GRAPH_API}/${encodeURIComponent(groupId)}?fields=name&access_token=${encodeURIComponent(token)}`)).json();
-		if (data.error || !data.name) return null;
+		if (data.error) throw new Error(formatGraphError(data.error, "group-info", groupId));
+		if (!data.name) return null;
 		return { name: data.name };
 	} catch {
 		return null;
 	}
 }
-async function fetchGroupMembers(token, groupId, afterCursor, limit = 10) {
-	let url = `${GRAPH_API}/${encodeURIComponent(groupId)}/members?fields=id,name,link&limit=${limit}&access_token=${encodeURIComponent(token)}`;
-	if (afterCursor) url += `&after=${encodeURIComponent(afterCursor)}`;
+async function fetchGroupMembers(token, groupId, afterCursor, limit = 10, nextPageUrl) {
+	let url = nextPageUrl ?? "";
+	if (!url) {
+		url = `${GRAPH_API}/${encodeURIComponent(groupId)}/members?fields=id,name,link&limit=${limit}&access_token=${encodeURIComponent(token)}`;
+		if (afterCursor) url += `&after=${encodeURIComponent(afterCursor)}`;
+	}
 	const data = await (await fetch(url)).json();
-	if (data.error) throw new Error(`[${data.error.code}] ${data.error.message}`);
-	const members = (data.data ?? []).map((m) => ({
-		id: m.id,
-		name: m.name ?? "",
-		link: m.link ?? `https://www.facebook.com/${m.id}`
-	}));
-	const nextCursor = data.paging?.cursors?.after ?? null;
-	return {
-		members,
-		nextCursor: !!data.paging?.next && members.length > 0 ? nextCursor : null
-	};
+	if (data.error) {
+		if (shouldRetryWithMembersField(data.error)) {
+			const fallbackUrl = buildMembersFieldUrl(token, groupId, limit, afterCursor ?? extractAfterCursor(nextPageUrl));
+			const fallbackData = await (await fetch(fallbackUrl)).json();
+			if (fallbackData.error) throw new Error(formatGraphError(fallbackData.error, "group-members", groupId));
+			return buildMemberPage(fallbackData.members?.data ?? [], fallbackData.members?.paging);
+		}
+		throw new Error(formatGraphError(data.error, "group-members", groupId));
+	}
+	return buildMemberPage(data.data ?? [], data.paging);
 }
 //#endregion
 //#region src/main/ipc/accounts.ts
@@ -890,6 +934,7 @@ var import_dist = (/* @__PURE__ */ __commonJSMin(((exports) => {
 var GroupExtractor = class {
 	mainWin;
 	abortFlag = false;
+	failedFlag = false;
 	seenMemberIds = /* @__PURE__ */ new Set();
 	runId = null;
 	totalExtracted = 0;
@@ -898,6 +943,7 @@ var GroupExtractor = class {
 	}
 	async start(groupIds, accountId) {
 		this.abortFlag = false;
+		this.failedFlag = false;
 		this.seenMemberIds.clear();
 		this.totalExtracted = 0;
 		const db = getDB();
@@ -912,6 +958,13 @@ var GroupExtractor = class {
 		const result = db.prepare(`INSERT INTO extraction_runs (group_ids, source_account_id, output_path) VALUES (?, ?, ?)`).run(JSON.stringify(groupIds), accountId, outputPath);
 		this.runId = result.lastInsertRowid;
 		const { token, name: sourceAccount } = getDecryptedToken(accountId);
+		const validation = await validateToken(token);
+		updateAccountStatus(accountId, validation.status, validation.name, validation.id);
+		if (!validation.valid) {
+			if (validation.status === "Blocked") throw new Error("Selected account is blocked by a login checkpoint (code 190). Re-login and pass the checkpoint, then validate the token again.");
+			if (validation.status === "Expired") throw new Error("Selected account token is expired. Please refresh and validate it again.");
+			throw new Error("Selected account token is invalid. Please refresh and validate it again.");
+		}
 		this.initializeCsv(outputPath);
 		for (let index = 0; index < groupIds.length; index++) {
 			if (this.abortFlag) break;
@@ -934,8 +987,9 @@ var GroupExtractor = class {
 				groupIndex: index,
 				totalGroups: groupIds.length
 			});
+			if (this.failedFlag) break;
 		}
-		const finalStatus = this.abortFlag ? "stopped" : "completed";
+		const finalStatus = this.abortFlag ? "stopped" : this.failedFlag ? "failed" : "completed";
 		if (this.runId) db.prepare(`UPDATE extraction_runs
          SET status = ?, completed_at = datetime('now'), members_extracted = ?
          WHERE id = ?`).run(finalStatus, this.totalExtracted, this.runId);
@@ -966,10 +1020,12 @@ var GroupExtractor = class {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
 		let currentBatch = 0;
 		let afterCursor = null;
+		let nextPageUrl = null;
+		let lastPageMarker = null;
 		while (!this.abortFlag) {
 			currentBatch += 1;
 			try {
-				const page = await fetchGroupMembers(token, groupId, afterCursor, 10);
+				const page = await fetchGroupMembers(token, groupId, afterCursor, 10, nextPageUrl);
 				const batchMembers = page.members.filter((member) => !this.seenMemberIds.has(member.id)).map((member) => {
 					this.seenMemberIds.add(member.id);
 					return {
@@ -998,11 +1054,19 @@ var GroupExtractor = class {
 					current_batch: currentBatch,
 					status: "running"
 				});
-				if (!page.nextCursor || page.members.length === 0) break;
-				afterCursor = page.nextCursor;
+				if (!page.hasMore) break;
+				const pageMarker = page.nextPageUrl ?? (page.nextCursor ? `cursor:${page.nextCursor}` : null);
+				if (!pageMarker || pageMarker === lastPageMarker) {
+					this.recordError(groupId, currentBatch, /* @__PURE__ */ new Error("Pagination stalled before all pages were fetched"));
+					break;
+				}
+				lastPageMarker = pageMarker;
+				nextPageUrl = page.nextPageUrl;
+				afterCursor = page.nextPageUrl ? null : page.nextCursor;
 				await this.delay(REQUEST_DELAY_MS);
 			} catch (error) {
 				this.recordError(groupId, currentBatch, error);
+				this.failedFlag = true;
 				break;
 			}
 		}
@@ -1037,23 +1101,6 @@ var GroupExtractor = class {
 		if (this.mainWin && !this.mainWin.isDestroyed()) this.mainWin.webContents.send("extraction:progress", progress);
 	}
 };
-//#endregion
-//#region src/main/ipc/extraction.ts
-var activeExtractor = null;
-function registerExtractionHandlers() {
-	ipcMain.handle("extraction:start", async (_event, groupIds, accountId) => {
-		const win = BrowserWindow.getAllWindows()[0];
-		if (!win) throw new Error("No window available");
-		activeExtractor = new GroupExtractor(win);
-		const outputPath = await activeExtractor.start(groupIds, accountId);
-		activeExtractor = null;
-		return { outputPath };
-	});
-	ipcMain.handle("extraction:stop", async () => {
-		if (activeExtractor) activeExtractor.stop();
-		return { stopped: true };
-	});
-}
 //#endregion
 //#region src/main/api/facebook-login.ts
 async function getSessionCookies(accessToken) {
@@ -1092,6 +1139,362 @@ async function loginToFacebook(accessToken, parentWindow) {
 			error: err.message ?? String(err)
 		};
 	}
+}
+//#endregion
+//#region src/main/extraction/group-scraper.ts
+var FB_EXCLUDE_PATHS = [
+	"groups",
+	"watch",
+	"reel",
+	"reels",
+	"marketplace",
+	"gaming",
+	"events",
+	"feeds",
+	"feed",
+	"stories",
+	"jobs",
+	"ads",
+	"pages",
+	"developers",
+	"help",
+	"settings",
+	"support",
+	"notifications",
+	"messages",
+	"friends",
+	"account",
+	"login",
+	"signup",
+	"recover",
+	"policy",
+	"terms",
+	"photo",
+	"photos",
+	"posts",
+	"videos",
+	"music",
+	"books",
+	"likes",
+	"about",
+	"overview",
+	"members",
+	"admins",
+	"moderators",
+	"pending",
+	"blocked",
+	"invite",
+	"discussion",
+	"media",
+	"files",
+	"userguides",
+	"discovery",
+	"suggested",
+	"invitees",
+	"membership",
+	"pending_members",
+	"hashtag",
+	"search",
+	"directory"
+];
+var SCRAPER_JS = [
+	"(function scrapeMembers() {",
+	"  var results = [];",
+	"  var seen = new Set();",
+	"",
+	"  function extractProfile(href) {",
+	"    if (!href) return null;",
+	"    var url = href;",
+	"    if (url.charAt(0) === '/') url = 'https://www.facebook.com' + url;",
+	"",
+	"    var groupUserMatch = url.match(/facebook\\.com\\/groups\\/\\d+\\/user\\/(\\d+)/);",
+	"    if (groupUserMatch) {",
+	"      return { id: groupUserMatch[1], url: 'https://www.facebook.com/profile.php?id=' + groupUserMatch[1] };",
+	"    }",
+	"",
+	"    var profileIdMatch = url.match(/facebook\\.com\\/profile\\.php[^?]*[?&]id=(\\d+)/);",
+	"    if (profileIdMatch) {",
+	"      return { id: profileIdMatch[1], url: 'https://www.facebook.com/profile.php?id=' + profileIdMatch[1] };",
+	"    }",
+	"",
+	"    var cleanUrl = url.split('?')[0].split('#')[0].replace(/\\/+$/, '');",
+	"    var parts = cleanUrl.replace('https://www.facebook.com/', '').split('/');",
+	"    if (parts.length >= 1 && parts[0]) {",
+	"      var username = parts[0];",
+	"      if (/^[a-zA-Z0-9.]{5,50}$/.test(username) && window.__fbExclude.indexOf(username) === -1) {",
+	"        return { id: username, url: 'https://www.facebook.com/' + username };",
+	"      }",
+	"    }",
+	"    return null;",
+	"  }",
+	"",
+	"  var allLinks = document.querySelectorAll('a[href]');",
+	"  for (var i = 0; i < allLinks.length; i++) {",
+	"    var a = allLinks[i];",
+	"    var profile = extractProfile(a.getAttribute('href'));",
+	"    if (!profile) continue;",
+	"    if (seen.has(profile.id)) continue;",
+	"",
+	"    var name = '';",
+	"    var img = a.querySelector('img');",
+	"    if (img) name = img.getAttribute('alt') || '';",
+	"    if (!name) {",
+	"      var spans = a.querySelectorAll('span');",
+	"      for (var j = 0; j < spans.length; j++) {",
+	"        var t = spans[j].textContent.trim();",
+	"        if (t.length >= 2 && t.length <= 100 && t.indexOf('\\n') === -1) { name = t; break; }",
+	"      }",
+	"    }",
+	"    if (!name) name = a.textContent.trim().split('\\n')[0].trim();",
+	"    if (name.length < 2) continue;",
+	"",
+	"    seen.add(profile.id);",
+	"    results.push({ id: profile.id, name: name, profileUrl: profile.url });",
+	"  }",
+	"  return results;",
+	"})();"
+].join("\n");
+var DEBUG_JS = [
+	"(function() {",
+	"  return {",
+	"    url: window.location.href,",
+	"    title: document.title,",
+	"    bodyLength: document.body ? document.body.innerHTML.length : 0,",
+	"    linkCount: document.querySelectorAll('a[href]').length,",
+	"    sampleLinks: Array.from(document.querySelectorAll('a[href]')).slice(0, 30).map(function(a) {",
+	"      return { href: a.getAttribute('href'), text: (a.textContent || '').trim().substring(0, 80) };",
+	"    }),",
+	"    hasLogin: !!document.querySelector('form[action*=\"login\"]'),",
+	"    bodySnippet: document.body ? document.body.innerHTML.substring(0, 5000) : ''",
+	"  };",
+	"})();"
+].join("\n");
+var GroupScraper = class {
+	mainWin;
+	abortFlag = false;
+	seenMemberIds = /* @__PURE__ */ new Set();
+	runId = null;
+	totalExtracted = 0;
+	scraperWindow = null;
+	constructor(win) {
+		this.mainWin = win;
+	}
+	async start(groupIds, accountId) {
+		this.abortFlag = false;
+		this.seenMemberIds.clear();
+		this.totalExtracted = 0;
+		const db = getDB();
+		const { filePath: outputPath } = await dialog.showSaveDialog(this.mainWin, {
+			defaultPath: join(app.getPath("documents"), "extraction-" + Date.now() + ".csv"),
+			filters: [{
+				name: "CSV",
+				extensions: ["csv"]
+			}]
+		});
+		if (!outputPath) throw new Error("No output path selected");
+		const result = db.prepare("INSERT INTO extraction_runs (group_ids, source_account_id, output_path) VALUES (?, ?, ?)").run(JSON.stringify(groupIds), accountId, outputPath);
+		this.runId = result.lastInsertRowid;
+		const { token, name: sourceAccount } = getDecryptedToken(accountId);
+		this.initializeCsv(outputPath);
+		const ses = session.fromPartition("persist:scraper");
+		const cookies = await getSessionCookies(token);
+		for (const cookie of cookies) await ses.cookies.set({
+			url: "https://www.facebook.com",
+			name: cookie.name,
+			value: cookie.value,
+			domain: cookie.domain ?? ".facebook.com",
+			path: cookie.path ?? "/",
+			secure: cookie.secure ?? true,
+			httpOnly: cookie.httponly ?? false
+		});
+		this.scraperWindow = new BrowserWindow({
+			width: 1280,
+			height: 900,
+			show: true,
+			webPreferences: {
+				session: ses,
+				nodeIntegration: false,
+				contextIsolation: true
+			}
+		});
+		this.scraperWindow.webContents.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
+		try {
+			for (let index = 0; index < groupIds.length; index++) {
+				if (this.abortFlag) break;
+				const groupId = groupIds[index];
+				this.emitProgress({
+					current_group_id: groupId,
+					current_group_index: index,
+					total_groups: groupIds.length,
+					members_extracted: this.totalExtracted,
+					current_batch: 0,
+					status: "running"
+				});
+				await this.scrapeGroup({
+					outputPath,
+					sourceAccount,
+					groupId,
+					groupIndex: index,
+					totalGroups: groupIds.length
+				});
+			}
+		} finally {
+			if (this.scraperWindow && !this.scraperWindow.isDestroyed()) {
+				this.scraperWindow.destroy();
+				this.scraperWindow = null;
+			}
+		}
+		const finalStatus = this.abortFlag ? "stopped" : "completed";
+		if (this.runId) db.prepare("UPDATE extraction_runs SET status = ?, completed_at = datetime('now'), members_extracted = ? WHERE id = ?").run(finalStatus, this.totalExtracted, this.runId);
+		this.emitProgress({
+			current_group_id: groupIds[Math.max(0, groupIds.length - 1)] ?? "",
+			current_group_index: Math.max(0, groupIds.length - 1),
+			total_groups: groupIds.length,
+			members_extracted: this.totalExtracted,
+			current_batch: 0,
+			status: finalStatus
+		});
+		return outputPath;
+	}
+	stop() {
+		this.abortFlag = true;
+	}
+	initializeCsv(outputPath) {
+		writeFileSync(outputPath, (0, import_dist.createObjectCsvStringifier)({ header: CSV_FIELDS.map((field) => ({
+			id: field,
+			title: field
+		})) }).getHeaderString() ?? "", "utf8");
+	}
+	async scrapeGroup(params) {
+		const { outputPath, sourceAccount, groupId, groupIndex, totalGroups } = params;
+		const db = getDB();
+		const insertMember = db.prepare("INSERT OR IGNORE INTO extraction_members (run_id, member_id, member_name, profile_url, group_id, group_name, extracted_at, source_account) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+		const scraper = this.scraperWindow;
+		const groupUrl = "https://www.facebook.com/groups/" + encodeURIComponent(groupId) + "/members";
+		await scraper.loadURL(groupUrl);
+		await this.delay(5e3);
+		await scraper.webContents.executeJavaScript("window.__fbExclude = " + JSON.stringify(FB_EXCLUDE_PATHS) + ";");
+		const debug = await scraper.webContents.executeJavaScript(DEBUG_JS);
+		const debugDir = join(dirname(outputPath), "scraper-debug");
+		mkdirSync(debugDir, { recursive: true });
+		writeFileSync(join(debugDir, "debug-" + groupId + ".json"), JSON.stringify(debug, null, 2), "utf8");
+		if (debug.hasLogin || debug.url.includes("login")) throw new Error("Facebook login page detected — session cookies may be invalid or expired. Try logging in again first.");
+		let currentBatch = 0;
+		let noNewCount = 0;
+		const MAX_NO_NEW = 5;
+		while (!this.abortFlag) {
+			currentBatch += 1;
+			try {
+				const scraped = await scraper.webContents.executeJavaScript(SCRAPER_JS);
+				const newMembers = [];
+				for (const m of scraped) {
+					if (this.seenMemberIds.has(m.id)) continue;
+					this.seenMemberIds.add(m.id);
+					newMembers.push({
+						member_id: m.id,
+						member_name: m.name,
+						profile_url: m.profileUrl,
+						group_id: groupId,
+						group_name: groupId,
+						extracted_at: (/* @__PURE__ */ new Date()).toISOString(),
+						source_account: sourceAccount
+					});
+				}
+				if (newMembers.length > 0) {
+					noNewCount = 0;
+					if (!this.runId) throw new Error("Extraction run not initialized");
+					db.transaction((members) => {
+						for (const member of members) insertMember.run(this.runId, member.member_id, member.member_name, member.profile_url, member.group_id, member.group_name, member.extracted_at, member.source_account);
+					})(newMembers);
+					this.appendBatchToCsv(outputPath, newMembers);
+					this.totalExtracted += newMembers.length;
+				} else noNewCount++;
+				this.emitProgress({
+					current_group_id: groupId,
+					current_group_index: groupIndex,
+					total_groups: totalGroups,
+					members_extracted: this.totalExtracted,
+					current_batch: currentBatch,
+					status: "running"
+				});
+				if (noNewCount >= MAX_NO_NEW) break;
+				await this.scrollPage(scraper);
+				await this.delay(REQUEST_DELAY_MS);
+			} catch (error) {
+				this.recordError(groupId, currentBatch, error);
+				break;
+			}
+		}
+	}
+	async scrollPage(win) {
+		await win.webContents.executeJavaScript("window.scrollBy({ top: 1200, behavior: 'smooth' });");
+		await this.delay(2e3);
+	}
+	appendBatchToCsv(outputPath, members) {
+		appendFileSync(outputPath, (0, import_dist.createObjectCsvStringifier)({ header: CSV_FIELDS.map((field) => ({
+			id: field,
+			title: field
+		})) }).stringifyRecords(members), "utf8");
+	}
+	recordError(groupId, batchNumber, error) {
+		const payload = {
+			group_id: groupId,
+			batch_number: batchNumber,
+			error_message: error instanceof Error ? error.message : String(error),
+			timestamp: (/* @__PURE__ */ new Date()).toISOString()
+		};
+		if (this.runId) getDB().prepare("INSERT INTO extraction_errors (run_id, group_id, batch_number, error_message, timestamp) VALUES (?, ?, ?, ?, ?)").run(this.runId, payload.group_id, payload.batch_number, payload.error_message, payload.timestamp);
+		if (this.mainWin && !this.mainWin.isDestroyed()) this.mainWin.webContents.send("extraction:error", payload);
+	}
+	delay(ms) {
+		return new Promise((resolve) => {
+			if (this.abortFlag) {
+				resolve();
+				return;
+			}
+			setTimeout(resolve, ms);
+		});
+	}
+	emitProgress(progress) {
+		if (this.mainWin && !this.mainWin.isDestroyed()) this.mainWin.webContents.send("extraction:progress", progress);
+	}
+};
+//#endregion
+//#region src/main/ipc/extraction.ts
+var activeExtractor = null;
+function registerExtractionHandlers() {
+	ipcMain.handle("extraction:start", async (_event, groupIds, accountId, useScraper = false) => {
+		const win = BrowserWindow.getAllWindows()[0];
+		if (!win) throw new Error("No window available");
+		if (useScraper) activeExtractor = new GroupScraper(win);
+		else activeExtractor = new GroupExtractor(win);
+		try {
+			const outputPath = await activeExtractor.start(groupIds, accountId);
+			activeExtractor = null;
+			return {
+				outputPath,
+				method: useScraper ? "scraper" : "api"
+			};
+		} catch (err) {
+			const msg = err?.message ?? String(err);
+			const isPermissionError = msg.includes("(#100)") || msg.includes("nonexisting field") || msg.includes("members");
+			if (!useScraper && isPermissionError) {
+				activeExtractor = new GroupScraper(win);
+				const outputPath = await activeExtractor.start(groupIds, accountId);
+				activeExtractor = null;
+				return {
+					outputPath,
+					method: "scraper"
+				};
+			}
+			activeExtractor = null;
+			throw err;
+		}
+	});
+	ipcMain.handle("extraction:stop", async () => {
+		if (activeExtractor) activeExtractor.stop();
+		return { stopped: true };
+	});
 }
 //#endregion
 //#region src/main/ipc/facebook.ts

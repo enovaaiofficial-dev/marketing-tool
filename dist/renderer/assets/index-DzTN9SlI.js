@@ -10200,6 +10200,7 @@ function GroupExtractor() {
 	const [progress, setProgress] = (0, import_react.useState)(null);
 	const [errors, setErrors] = (0, import_react.useState)([]);
 	const [isRunning, setIsRunning] = (0, import_react.useState)(false);
+	const [useScraper, setUseScraper] = (0, import_react.useState)(false);
 	const [message, setMessage] = (0, import_react.useState)(null);
 	const errorLogRef = (0, import_react.useRef)(null);
 	const loadAccounts = (0, import_react.useCallback)(async () => {
@@ -10213,7 +10214,7 @@ function GroupExtractor() {
 	(0, import_react.useEffect)(() => {
 		const unsubProgress = window.api.extraction.onProgress((p) => {
 			setProgress(p);
-			if (p.status === "completed" || p.status === "stopped") setIsRunning(false);
+			if (p.status === "completed" || p.status === "stopped" || p.status === "failed") setIsRunning(false);
 		});
 		const unsubError = window.api.extraction.onError((e) => {
 			setErrors((prev) => [...prev, e]);
@@ -10238,10 +10239,17 @@ function GroupExtractor() {
 		}
 		setIsRunning(true);
 		setErrors([]);
-		setProgress(null);
+		setProgress({
+			current_group_id: groupIds[0] ?? "",
+			current_group_index: 0,
+			total_groups: groupIds.length,
+			members_extracted: 0,
+			current_batch: 0,
+			status: "running"
+		});
 		showMessage("Extraction started", "success");
-		window.api.extraction.start(groupIds, selectedAccountId).then(({ outputPath }) => {
-			showMessage(`Extraction finished: ${outputPath}`, "success");
+		window.api.extraction.start(groupIds, selectedAccountId, useScraper).then(({ outputPath, method }) => {
+			showMessage(`Extraction finished${method === "scraper" ? " (via web scraping)" : ""}: ${outputPath}`, "success");
 		}).catch((err) => {
 			showMessage(err.message, "error");
 			setIsRunning(false);
@@ -10259,6 +10267,7 @@ function GroupExtractor() {
 		setTimeout(() => setMessage(null), 3e3);
 	};
 	const progressPercent = progress && progress.total_groups > 0 ? Math.round((progress.current_group_index + 1) / progress.total_groups * 100) : 0;
+	const hasExtractedMembers = (progress?.members_extracted ?? 0) > 0;
 	return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 		className: "p-6 max-w-5xl",
 		children: [
@@ -10311,6 +10320,24 @@ function GroupExtractor() {
 							children: "No valid accounts. Add and validate tokens in Account Manager first."
 						})
 					] }),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", {
+						className: "flex items-center gap-3",
+						children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+							className: "flex items-center gap-2",
+							children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("input", {
+								type: "checkbox",
+								id: "useScraper",
+								checked: useScraper,
+								onChange: (e) => setUseScraper(e.target.checked),
+								disabled: isRunning,
+								className: "h-4 w-4 rounded border-gray-300 text-blue-600"
+							}), /* @__PURE__ */ (0, import_jsx_runtime.jsx)("label", {
+								htmlFor: "useScraper",
+								className: "text-sm text-gray-700",
+								children: "Use web scraping (bypasses API permission requirement)"
+							})]
+						})
+					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "flex gap-2",
 						children: [/* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", {
@@ -10333,6 +10360,15 @@ function GroupExtractor() {
 					/* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", {
 						className: "text-sm font-medium text-gray-700 mb-3",
 						children: "Progress"
+					}),
+					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
+						className: `mb-3 rounded-md px-3 py-2 text-sm ${progress.status === "running" ? "bg-blue-50 text-blue-700" : progress.status === "failed" ? "bg-red-50 text-red-700" : hasExtractedMembers ? "bg-green-50 text-green-700" : errors.length > 0 ? "bg-red-50 text-red-700" : "bg-yellow-50 text-yellow-700"}`,
+						children: [
+							progress.status === "running" && `Extracting group ${progress.current_group_index + 1} of ${progress.total_groups}...`,
+							progress.status === "failed" && "Extraction failed. Facebook denied access or another extraction error occurred.",
+							progress.status === "completed" && (hasExtractedMembers ? `Extraction completed. Extracted ${progress.members_extracted} member${progress.members_extracted === 1 ? "" : "s"}.` : "Extraction completed, but no members were extracted."),
+							progress.status === "stopped" && `Extraction stopped. Extracted ${progress.members_extracted} member${progress.members_extracted === 1 ? "" : "s"}.`
+						]
 					}),
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", {
 						className: "grid grid-cols-2 gap-2 text-sm mb-3",
@@ -10397,6 +10433,10 @@ function GroupExtractor() {
 					/* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", {
 						className: "text-xs text-gray-400 mt-1",
 						children: [progressPercent, "%"]
+					}),
+					progress.status !== "running" && progress.status !== "failed" && !hasExtractedMembers && /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", {
+						className: "text-xs text-gray-500 mt-2",
+						children: "No member rows were written to the CSV for this run."
 					})
 				]
 			}),

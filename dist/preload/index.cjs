@@ -9,7 +9,7 @@ electron.contextBridge.exposeInMainWorld("api", {
 		export: () => electron.ipcRenderer.invoke("account:export")
 	},
 	extraction: {
-		start: (groupIds, accountId) => electron.ipcRenderer.invoke("extraction:start", groupIds, accountId),
+		start: (groupIds, accountId, useScraper) => electron.ipcRenderer.invoke("extraction:start", groupIds, accountId, useScraper),
 		stop: () => electron.ipcRenderer.invoke("extraction:stop"),
 		onProgress: (callback) => {
 			electron.ipcRenderer.on("extraction:progress", (_event, data) => callback(data));

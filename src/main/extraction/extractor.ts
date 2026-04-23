@@ -4,14 +4,15 @@ import { appendFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { createObjectCsvStringifier } from "csv-writer";
 import { getDB } from "../db/connection";
-import { getDecryptedToken } from "../db/accounts-repo";
-import { fetchGroupInfo, fetchGroupMembers } from "../api/platform-client";
+import { getDecryptedToken, updateAccountStatus } from "../db/accounts-repo";
+import { fetchGroupInfo, fetchGroupMembers, validateToken } from "../api/platform-client";
 import { CSV_FIELDS, BATCH_SIZE, REQUEST_DELAY_MS } from "@shared/constants";
 import type { ExtractedMember, ExtractionError, ExtractionProgress } from "@shared/types";
 
 export class GroupExtractor {
   private mainWin: BrowserWindow;
   private abortFlag = false;
+  private failedFlag = false;
   private seenMemberIds = new Set<string>();
   private runId: number | null = null;
   private totalExtracted = 0;
@@ -22,6 +23,7 @@ export class GroupExtractor {
 
   async start(groupIds: string[], accountId: number): Promise<string> {
     this.abortFlag = false;
+    this.failedFlag = false;
     this.seenMemberIds.clear();
     this.totalExtracted = 0;
 
@@ -43,6 +45,20 @@ export class GroupExtractor {
     this.runId = result.lastInsertRowid as number;
 
     const { token, name: sourceAccount } = getDecryptedToken(accountId);
+    const validation = await validateToken(token);
+    updateAccountStatus(accountId, validation.status, validation.name, validation.id);
+    if (!validation.valid) {
+      if (validation.status === "Blocked") {
+        throw new Error(
+          "Selected account is blocked by a login checkpoint (code 190). Re-login and pass the checkpoint, then validate the token again."
+        );
+      }
+      if (validation.status === "Expired") {
+        throw new Error("Selected account token is expired. Please refresh and validate it again.");
+      }
+      throw new Error("Selected account token is invalid. Please refresh and validate it again.");
+    }
+
     this.initializeCsv(outputPath);
 
     for (let index = 0; index < groupIds.length; index++) {
@@ -72,9 +88,13 @@ export class GroupExtractor {
         groupIndex: index,
         totalGroups: groupIds.length,
       });
+
+      if (this.failedFlag) {
+        break;
+      }
     }
 
-    const finalStatus = this.abortFlag ? "stopped" : "completed";
+    const finalStatus = this.abortFlag ? "stopped" : this.failedFlag ? "failed" : "completed";
     if (this.runId) {
       db.prepare(
         `UPDATE extraction_runs
@@ -126,12 +146,20 @@ export class GroupExtractor {
 
     let currentBatch = 0;
     let afterCursor: string | null = null;
+    let nextPageUrl: string | null = null;
+    let lastPageMarker: string | null = null;
 
     while (!this.abortFlag) {
       currentBatch += 1;
 
       try {
-        const page = await fetchGroupMembers(token, groupId, afterCursor, BATCH_SIZE);
+        const page = await fetchGroupMembers(
+          token,
+          groupId,
+          afterCursor,
+          BATCH_SIZE,
+          nextPageUrl
+        );
         const batchMembers = page.members
           .filter((member) => !this.seenMemberIds.has(member.id))
           .map<ExtractedMember>((member) => {
@@ -181,14 +209,27 @@ export class GroupExtractor {
           status: "running",
         });
 
-        if (!page.nextCursor || page.members.length === 0) {
+        if (!page.hasMore) {
           break;
         }
 
-        afterCursor = page.nextCursor;
+        const pageMarker = page.nextPageUrl ?? (page.nextCursor ? `cursor:${page.nextCursor}` : null);
+        if (!pageMarker || pageMarker === lastPageMarker) {
+          this.recordError(
+            groupId,
+            currentBatch,
+            new Error("Pagination stalled before all pages were fetched")
+          );
+          break;
+        }
+
+        lastPageMarker = pageMarker;
+        nextPageUrl = page.nextPageUrl;
+        afterCursor = page.nextPageUrl ? null : page.nextCursor;
         await this.delay(REQUEST_DELAY_MS);
       } catch (error) {
         this.recordError(groupId, currentBatch, error);
+        this.failedFlag = true;
         break;
       }
     }

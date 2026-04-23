@@ -26,7 +26,7 @@ export interface ExtractionProgress {
   total_groups: number;
   members_extracted: number;
   current_batch: number;
-  status: "running" | "stopped" | "completed";
+  status: "running" | "stopped" | "completed" | "failed";
 }
 
 export interface ExtractionError {
