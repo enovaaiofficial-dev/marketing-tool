@@ -79,6 +79,15 @@ export function deleteAccounts(ids: number[]): number {
   const deleteRuns = db.prepare(
     `DELETE FROM extraction_runs WHERE source_account_id IN (${placeholders})`
   );
+  const deleteChatErrors = db.prepare(
+    `DELETE FROM chat_creation_errors WHERE run_id IN (SELECT id FROM chat_runs WHERE source_account_id IN (${placeholders}))`
+  );
+  const deleteChatGroups = db.prepare(
+    `DELETE FROM chat_groups_created WHERE run_id IN (SELECT id FROM chat_runs WHERE source_account_id IN (${placeholders}))`
+  );
+  const deleteChatRuns = db.prepare(
+    `DELETE FROM chat_runs WHERE source_account_id IN (${placeholders})`
+  );
   const deleteAccounts = db.prepare(
     `DELETE FROM accounts WHERE id IN (${placeholders})`
   );
@@ -87,6 +96,9 @@ export function deleteAccounts(ids: number[]): number {
     deleteErrors.run(...ids);
     deleteMembers.run(...ids);
     deleteRuns.run(...ids);
+    deleteChatErrors.run(...ids);
+    deleteChatGroups.run(...ids);
+    deleteChatRuns.run(...ids);
     const result = deleteAccounts.run(...ids);
     return result.changes;
   });

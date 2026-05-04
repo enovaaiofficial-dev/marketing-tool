@@ -20,17 +20,18 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.1",
+    "@vitejs/plugin-react": "^5.2.0",
     "autoprefixer": "^10.5.0",
     "electron": "^41.2.2",
     "electron-vite": "^5.0.0",
     "postcss": "^8.5.10",
     "tailwindcss": "^4.2.4",
     "typescript": "^6.0.3",
-    "vite": "^8.0.9"
+    "vite": "^7.3.2"
   },
   "dependencies": {
     "better-sqlite3": "^12.9.0",
+    "biar-fca": "^3.9.5",
     "csv-writer": "^1.6.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"

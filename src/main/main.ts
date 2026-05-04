@@ -3,6 +3,7 @@ import { resolve } from "path";
 import { registerAccountHandlers } from "./ipc/accounts";
 import { registerExtractionHandlers, saveActiveExtraction } from "./ipc/extraction";
 import { registerFacebookHandlers } from "./ipc/facebook";
+import { registerChatHandlers, pauseActiveChatRun } from "./ipc/chat";
 import { initDB } from "./db/connection";
 
 if (process.env.NODE_ENV !== "production") {
@@ -39,6 +40,7 @@ app.whenReady().then(() => {
   registerAccountHandlers();
   registerExtractionHandlers();
   registerFacebookHandlers();
+  registerChatHandlers();
   createWindow();
 
   app.on("activate", () => {
@@ -50,6 +52,7 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", (e) => {
+app.on("before-quit", () => {
   saveActiveExtraction();
+  pauseActiveChatRun();
 });

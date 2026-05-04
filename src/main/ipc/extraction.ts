@@ -1,8 +1,15 @@
 import { ipcMain, BrowserWindow } from "electron";
-import { GroupExtractor } from "../extraction/extractor";
-import { GroupScraper, getActiveScraper } from "../extraction/group-scraper";
+import {
+  GroupScraper,
+  getActiveScraper,
+  type ScraperStartOptions,
+} from "../extraction/group-scraper";
 
-let activeExtractor: GroupExtractor | GroupScraper | null = null;
+let activeScraper: GroupScraper | null = null;
+
+interface ExtractionStartOptions extends ScraperStartOptions {
+  resumeRunId?: number | null;
+}
 
 export function registerExtractionHandlers() {
   ipcMain.handle(
@@ -11,61 +18,51 @@ export function registerExtractionHandlers() {
       _event,
       groupIds: string[],
       accountId: number,
-      useScraper: boolean = false,
-      resumeRunId: number | null = null
+      options: ExtractionStartOptions = {}
     ) => {
       const win = BrowserWindow.getAllWindows()[0];
       if (!win) throw new Error("No window available");
 
-      if (useScraper || resumeRunId) {
-        const scraper = new GroupScraper(win);
-        activeExtractor = scraper;
-        const outputPath = await scraper.start(groupIds, accountId, resumeRunId);
-        activeExtractor = null;
-        return { outputPath, method: "scraper", runId: scraper.getRunId() };
-      }
+      const scraperOpts: ScraperStartOptions = {
+        concurrency: options.concurrency,
+        showWindow: options.showWindow,
+      };
+      const resumeRunId = options.resumeRunId ?? null;
 
+      const scraper = new GroupScraper(win);
+      activeScraper = scraper;
       try {
-        activeExtractor = new GroupExtractor(win);
-        const outputPath = await activeExtractor.start(groupIds, accountId);
-        activeExtractor = null;
-        return { outputPath, method: "api" };
-      } catch (err: any) {
-        const msg = err?.message ?? String(err);
-        const isPermissionError =
-          msg.includes("(#100)") || msg.includes("nonexisting field") || msg.includes("members");
-
-        if (isPermissionError) {
-          const scraper = new GroupScraper(win);
-          activeExtractor = scraper;
-          const outputPath = await scraper.start(groupIds, accountId);
-          activeExtractor = null;
-          return { outputPath, method: "scraper", runId: scraper.getRunId() };
-        }
-
-        activeExtractor = null;
-        throw err;
+        const outputPath = await scraper.start(groupIds, accountId, resumeRunId, scraperOpts);
+        return { outputPath, method: "scraper", runId: scraper.getRunId() };
+      } finally {
+        activeScraper = null;
       }
     }
   );
 
   ipcMain.handle("extraction:stop", async () => {
-    if (activeExtractor) {
-      activeExtractor.stop();
+    if (activeScraper) {
+      activeScraper.stop();
     }
     return { stopped: true };
   });
 
-  ipcMain.handle("extraction:resume-run", async (_event, runId: number) => {
-    const win = BrowserWindow.getAllWindows()[0];
-    if (!win) throw new Error("No window available");
+  ipcMain.handle(
+    "extraction:resume-run",
+    async (_event, runId: number, options?: ScraperStartOptions) => {
+      const win = BrowserWindow.getAllWindows()[0];
+      if (!win) throw new Error("No window available");
 
-    const scraper = new GroupScraper(win);
-    activeExtractor = scraper;
-    const outputPath = await scraper.start([], 0, runId);
-    activeExtractor = null;
-    return { outputPath, method: "scraper", runId: scraper.getRunId() };
-  });
+      const scraper = new GroupScraper(win);
+      activeScraper = scraper;
+      try {
+        const outputPath = await scraper.start([], 0, runId, options ?? {});
+        return { outputPath, method: "scraper", runId: scraper.getRunId() };
+      } finally {
+        activeScraper = null;
+      }
+    }
+  );
 
   ipcMain.handle("extraction:stopped-runs", async () => {
     const { getDB } = require("../db/connection");
@@ -83,7 +80,7 @@ export function saveActiveExtraction() {
   if (scraper && scraper.isRunning()) {
     scraper.forceSave();
   }
-  if (activeExtractor) {
-    activeExtractor.stop();
+  if (activeScraper) {
+    activeScraper.stop();
   }
 }

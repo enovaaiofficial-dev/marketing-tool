@@ -28,6 +28,7 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve(__dirname, "src/preload/index.ts"),
+          scraper: resolve(__dirname, "src/preload/scraper.ts"),
         },
         external: ["electron"],
         output: {

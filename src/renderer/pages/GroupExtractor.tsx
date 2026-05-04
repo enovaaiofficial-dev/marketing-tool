@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import type { Account, ExtractionProgress, ExtractionError } from "@shared/types";
 import type { StoppedRun } from "../types";
 
+const MAX_CONCURRENCY = 5;
+
 export default function GroupExtractor() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [groupIdInput, setGroupIdInput] = useState("");
@@ -9,10 +11,13 @@ export default function GroupExtractor() {
   const [progress, setProgress] = useState<ExtractionProgress | null>(null);
   const [errors, setErrors] = useState<ExtractionError[]>([]);
   const [isRunning, setIsRunning] = useState(false);
-  const [useScraper, setUseScraper] = useState(false);
+  const [showScraperWindow, setShowScraperWindow] = useState(false);
+  const [concurrency, setConcurrency] = useState<number>(1);
   const [stoppedRuns, setStoppedRuns] = useState<StoppedRun[]>([]);
   const [message, setMessage] = useState<{ text: string; type: "success" | "error" } | null>(null);
   const errorLogRef = useRef<HTMLDivElement>(null);
+
+  const effectiveConcurrencyMax = Math.max(1, Math.min(accounts.length, MAX_CONCURRENCY));
 
   const loadAccounts = useCallback(async () => {
     try {
@@ -32,6 +37,17 @@ export default function GroupExtractor() {
     loadAccounts();
     loadStoppedRuns();
   }, [loadAccounts, loadStoppedRuns]);
+
+  // Default the concurrency input to the number of valid accounts (capped),
+  // so users with multiple accounts get parallel workers automatically.
+  useEffect(() => {
+    if (accounts.length === 0) return;
+    setConcurrency((prev) => {
+      const target = Math.min(accounts.length, MAX_CONCURRENCY);
+      // Only auto-update if the user hasn't manually picked a value within range.
+      return prev === 1 || prev > target ? target : prev;
+    });
+  }, [accounts.length]);
 
   useEffect(() => {
     const unsubProgress = window.api.extraction.onProgress((p) => {
@@ -84,12 +100,15 @@ export default function GroupExtractor() {
       status: "running",
     });
 
+    const clampedConcurrency = Math.max(1, Math.min(concurrency, effectiveConcurrencyMax));
     showMessage("Extraction started", "success");
     window.api.extraction
-      .start(groupIds, selectedAccountId, useScraper)
-      .then(({ outputPath, method }) => {
-        const methodLabel = method === "scraper" ? " (via web scraping)" : "";
-        showMessage("Extraction finished" + methodLabel + ": " + outputPath, "success");
+      .start(groupIds, selectedAccountId, {
+        concurrency: clampedConcurrency,
+        showWindow: showScraperWindow,
+      })
+      .then(({ outputPath }) => {
+        showMessage("Extraction finished: " + outputPath, "success");
       })
       .catch((err: any) => {
         showMessage(err.message, "error");
@@ -100,9 +119,13 @@ export default function GroupExtractor() {
   const handleResume = async (run: StoppedRun) => {
     setIsRunning(true);
     setErrors([]);
+    const clampedConcurrency = Math.max(1, Math.min(concurrency, effectiveConcurrencyMax));
     showMessage("Resuming extraction...", "success");
     window.api.extraction
-      .resumeRun(run.id)
+      .resumeRun(run.id, {
+        concurrency: clampedConcurrency,
+        showWindow: showScraperWindow,
+      })
       .then(({ outputPath }) => {
         showMessage("Extraction resumed and finished: " + outputPath, "success");
       })
@@ -171,7 +194,7 @@ export default function GroupExtractor() {
           </select>
           {accounts.length > 1 && (
             <p className="mt-1 text-xs text-blue-600">
-              {accounts.length} valid accounts available — auto-rotation enabled for scraper mode
+              {accounts.length} valid accounts available — extraction runs up to {effectiveConcurrencyMax} groups in parallel (one per account)
             </p>
           )}
           {accounts.length === 0 && (
@@ -181,18 +204,48 @@ export default function GroupExtractor() {
           )}
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="border-t border-gray-100 pt-4 space-y-3">
+          <p className="text-xs font-medium uppercase tracking-wide text-gray-500">
+            Extraction options
+          </p>
+
+          <div className="flex items-center gap-3">
+            <label htmlFor="concurrency" className="text-sm text-gray-700 min-w-[120px]">
+              Parallel workers
+            </label>
+            <input
+              id="concurrency"
+              type="number"
+              min={1}
+              max={effectiveConcurrencyMax}
+              value={concurrency}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (Number.isFinite(v) && v > 0) {
+                  setConcurrency(Math.min(Math.max(1, Math.floor(v)), effectiveConcurrencyMax));
+                }
+              }}
+              disabled={isRunning || accounts.length <= 1}
+              className="w-20 p-1.5 border border-gray-300 rounded-md text-sm"
+            />
+            <span className="text-xs text-gray-500">
+              {accounts.length <= 1
+                ? "(need 2+ valid accounts to parallelize)"
+                : `1 worker per account · max ${effectiveConcurrencyMax}`}
+            </span>
+          </div>
+
           <div className="flex items-center gap-2">
             <input
               type="checkbox"
-              id="useScraper"
-              checked={useScraper}
-              onChange={(e) => setUseScraper(e.target.checked)}
+              id="showScraperWindow"
+              checked={showScraperWindow}
+              onChange={(e) => setShowScraperWindow(e.target.checked)}
               disabled={isRunning}
               className="h-4 w-4 rounded border-gray-300 text-blue-600"
             />
-            <label htmlFor="useScraper" className="text-sm text-gray-700">
-              Use web scraping (bypasses API permission requirement)
+            <label htmlFor="showScraperWindow" className="text-sm text-gray-700">
+              Show scraper windows (debug — slower)
             </label>
           </div>
         </div>
